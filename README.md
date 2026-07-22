@@ -1,4 +1,4 @@
-# fileformats-codecs
+# ffmpeg-codecs
 
 WebAssembly video decoders transcribed / ported from **FFmpeg** `libavcodec`
 (release/8.1). Because they are derived from FFmpeg source, they are licensed under

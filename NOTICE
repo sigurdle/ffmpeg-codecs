@@ -1,5 +1,5 @@
-fileformats-codecs — video decoders derived from FFmpeg
-=======================================================
+ffmpeg-codecs — video decoders derived from FFmpeg
+==================================================
 
 The C/C++ sources in this repository were transcribed / ported from FFmpeg's
 libavcodec (release/8.1) and are therefore derivative works of FFmpeg, licensed
