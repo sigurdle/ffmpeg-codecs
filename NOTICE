@@ -1,0 +1,29 @@
+fileformats-codecs — video decoders derived from FFmpeg
+=======================================================
+
+The C/C++ sources in this repository were transcribed / ported from FFmpeg's
+libavcodec (release/8.1) and are therefore derivative works of FFmpeg, licensed
+under the GNU Lesser General Public License, version 2.1 or later (see LICENSE).
+
+FFmpeg — Copyright (c) the FFmpeg developers — https://ffmpeg.org/
+
+They are compiled to WebAssembly and loaded at runtime by a separate application.
+That application is NOT part of this library and is not covered by this license;
+this repository is the "corresponding source" for the compiled decoder binaries,
+provided to satisfy LGPL-2.1 section 6.
+
+Decoder → corresponding FFmpeg libavcodec source
+------------------------------------------------
+  vc1/         VC-1 / WMV3 (Simple & Main)   vc1*.c, vc1{,data,_vlc_data,acdata}.h, wmv2data.c
+  msmpeg4/     WMV1 (MS-MPEG4 v1)            msmpeg4*.c/.h, msmpeg4data.c
+  mpeg4/       MPEG-4 Part 2 + H.263        mpeg4videodec.c, h263*.c, mpeg4data.*, simple_idct.c
+  vp6/         On2 VP6                      vp6.c, vp56.c, vp6*.h, vp56data.*
+  retrovideo/  Cinepak, MS Video-1,         cinepak.c, msvideo1.c, indeo2/3.c, ivi.c, indeo4/5.c
+               Intel Indeo 2/3/4/5
+  svq3/        Sorenson Video 3 (SVQ3)      svq3.c (+ shared H.264 machinery)
+
+Each source file also carries a one-line provenance header naming the FFmpeg
+file(s) it was transcribed from.
+
+Note: these were transcribed only from LGPL-licensed libavcodec decoder sources
+(not from any GPL-only FFmpeg component).
