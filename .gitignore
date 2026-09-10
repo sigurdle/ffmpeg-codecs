@@ -3,3 +3,8 @@
 *.mjs
 *.o
 *.js
+
+# ...but the table extractors are source, not build output: they generate the
+# committed *_tables.h from an FFmpeg checkout and are part of the scripts used
+# to produce the decoder.
+!extract_tables.mjs

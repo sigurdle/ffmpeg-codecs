@@ -1,6 +1,6 @@
 # ffmpeg-codecs
 
-WebAssembly video decoders transcribed / ported from **FFmpeg** `libavcodec`
+WebAssembly video and audio decoders transcribed / ported from **FFmpeg** `libavcodec`
 (release/8.1). Because they are derived from FFmpeg source, they are licensed under
 the **GNU LGPL-2.1-or-later** (see [`LICENSE`](./LICENSE) and [`NOTICE`](./NOTICE)).
 
@@ -19,11 +19,15 @@ work that merely *uses* these decoders and is not covered by this license.
 | `vp6/` | On2 VP6 (VP6, VP6F) |
 | `retrovideo/` | Cinepak, Microsoft Video-1, Intel Indeo 2/3/4/5 |
 | `svq3/` | Sorenson Video 3 (SVQ3) |
+| `ac3/` | AC-3 / Dolby Digital (ATSC A/52) audio |
+| `mpegaudio/` | MPEG-1/2/2.5 audio, Layers I, II and III (MP1 / MP2 / MP3) |
 | `common/` | shared kernels (`wasm_simd_idct.h`) |
 
-Only the transcribed C/C++ sources and their build scripts are included. The
-application-side JavaScript glue that loads and drives the modules is *not* part of
-this library and lives with the application.
+Only the transcribed C/C++ sources and the scripts used to produce them are included
+— each codec's `build.sh`, plus `mpegaudio/extract_tables.mjs`, which regenerates the
+committed `mpegaudio_tables.h` from an FFmpeg checkout. The application-side JavaScript
+glue that loads and drives the modules is *not* part of this library and lives with the
+application.
 
 ## Building
 
@@ -36,6 +40,12 @@ directory layout intact.
 ```sh
 cd vc1 && ./build.sh        # -> vc1_decode.{wasm,mjs}
 ```
+
+These are the scripts used to build the shipped binaries, unedited, so each also emits a
+second `node`-flavored module into the application's `tests/wasm/` for its conformance
+test. That path does not exist in this repository, so the script writes the shipped
+`.wasm` and `.mjs` first and then exits non-zero at the test link — the decoder you need
+is already built at that point.
 
 ## Relinking (LGPL §6)
 

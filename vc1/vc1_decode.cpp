@@ -36,6 +36,9 @@ KEEP int vc1_open(int width, int height) {
     int plane = v->mb_stride * v->mb_height;
     v->mv_type_mb_plane = (uint8_t*)calloc(plane, 1);
     v->mbskip_table     = (uint8_t*)calloc(plane, 1);
+    v->acpred_plane     = (uint8_t*)calloc(plane, 1);   // AP I: per-MB AC-pred flag
+    v->over_flags_plane = (uint8_t*)calloc(plane, 1);   // AP I: condover SELECT flag
+    v->qscale_table     = (int16_t*)calloc(plane, sizeof(int16_t));  // AP: per-MB mquant
 
     // Output planes (MB-aligned), like the msmpeg4 port.
     v->codedW  = v->mb_width * 16;  v->codedH = v->mb_height * 16;
@@ -67,7 +70,9 @@ KEEP int vc1_open(int width, int height) {
     v->fr_ttblk   = (int*)     calloc((size_t)nmb, sizeof(int));
     v->fr_isintra = (uint8_t*) calloc((size_t)nmb, 1);
     v->fr_lumamv  = (int16_t(*)[2])calloc((size_t)nmb, sizeof(int16_t) * 2);
-    if (!v->mv_type_mb_plane || !v->mbskip_table || !v->planeY || !v->planeU || !v->planeV ||
+    if (!v->mv_type_mb_plane || !v->mbskip_table || !v->acpred_plane || !v->over_flags_plane ||
+        !v->qscale_table ||
+        !v->planeY || !v->planeU || !v->planeV ||
         !v->dc_base || !v->ac_base || !v->coded_base || !v->mv_base || !v->mbtype_base ||
         !v->refY || !v->refU || !v->refV || !v->fr_cbp || !v->fr_ttblk || !v->fr_isintra || !v->fr_lumamv) {
         vc1_close((int)(intptr_t)v);
@@ -98,6 +103,9 @@ KEEP void vc1_close(int handle) {
     if (!v) return;
     free(v->mv_type_mb_plane);
     free(v->mbskip_table);
+    free(v->acpred_plane);
+    free(v->over_flags_plane);
+    free(v->qscale_table);
     free(v->planeY); free(v->planeU); free(v->planeV);
     free(v->dc_base); free(v->ac_base); free(v->coded_base);
     free(v->mv_base); free(v->mbtype_base);
@@ -213,6 +221,116 @@ KEEP int vc1_decode_frame(int handle, const uint8_t* bytes, int len) {
         return vc1_decode_p_frame(v, &gb);
     }
     return VC1_ERR;
+}
+
+// Advanced Profile (WVC1) header conformance hook. Feeds a raw .vc1 elementary
+// stream (or extradata+frame): splits BDUs by start code, unescapes each, parses the
+// sequence + entry-point headers and the FIRST frame header, and dumps the decoded
+// fields to out[40] for field-exact comparison against ffmpeg `-v debug`. Returns 0
+// once a frame header has been parsed. The handle must be opened at the coded size.
+KEEP int vc1_test_adv_headers(int handle, const uint8_t* bytes, int len, int* out) {
+    VC1Context* v = (VC1Context*)(intptr_t)handle;
+    if (!v || !out || len <= 0) return VC1_ERR;
+    uint8_t* scratch = (uint8_t*)malloc((size_t)len + 8);
+    if (!scratch) return VC1_ERR;
+
+    const uint8_t* end = bytes + len;
+    const uint8_t* start = vc1_find_next_marker(bytes, end);
+    int got_seq = 0, got_entry = 0, got_frame = 0;
+
+    while (start < end && !got_frame) {
+        const uint8_t* next = vc1_find_next_marker(start + 4, end);
+        int size = (int)(next - start - 4);
+        if (size > 0) {
+            int usize = vc1_unescape_buffer(start + 4, size, scratch);
+            memset(scratch + usize, 0, 8);                 // trailing pad for the bit reader
+            int type = start[3];                           // low byte of 0x000001xx
+            mp4::GetBits gb;
+            mp4::init_get_bits(&gb, scratch, usize);
+            if (type == 0x0F) {                            // VC1_CODE_SEQHDR
+                v->profile = (int)mp4::get_bits(&gb, 2);
+                if (v->profile == PROFILE_ADVANCED &&
+                    vc1_decode_sequence_header_adv(v, &gb) == VC1_OK) got_seq = 1;
+            } else if (type == 0x0E) {                     // VC1_CODE_ENTRYPOINT
+                if (vc1_decode_entry_point(v, &gb) == VC1_OK) got_entry = 1;
+            } else if (type == 0x0D) {                     // VC1_CODE_FRAME
+                if (vc1_parse_frame_header_adv(v, &gb) == VC1_OK) {
+                    out[38] = mp4::get_bits_count(&gb);
+                    got_frame = 1;
+                }
+            }
+        }
+        start = next;
+    }
+    free(scratch);
+
+    out[0]  = v->level;            out[1]  = v->chromaformat;
+    out[2]  = v->frmrtq_postproc;  out[3]  = v->bitrtq_postproc;
+    out[4]  = v->postprocflag;     out[5]  = v->broadcast;
+    out[6]  = v->interlace;        out[7]  = v->tfcntrflag;
+    out[8]  = v->finterpflag;      out[9]  = v->max_coded_width;
+    out[10] = v->max_coded_height; out[11] = v->hrd_param_flag;
+    out[12] = v->broken_link;      out[13] = v->closed_entry;
+    out[14] = v->panscanflag;      out[15] = v->refdist_flag;
+    out[16] = v->loop_filter;      out[17] = v->fastuvmc;
+    out[18] = v->extended_mv;      out[19] = v->dquant;
+    out[20] = v->vstransform;      out[21] = v->overlap;
+    out[22] = v->quantizer_mode;   out[23] = v->width;
+    out[24] = v->height;           out[25] = v->range_mapy_flag;
+    out[26] = v->range_mapuv_flag; out[27] = v->fcm;
+    out[28] = v->pict_type;        out[29] = v->pqindex;
+    out[30] = v->pq;               out[31] = v->halfpq;
+    out[32] = v->pquantizer;       out[33] = v->rnd;
+    out[34] = v->acpred_imode;     out[35] = v->acpred_invert;
+    out[36] = v->condover;         out[37] = v->rptfrm;
+    out[39] = (got_seq && got_entry && got_frame) ? 1 : 0;
+    return out[39] ? 0 : VC1_ERR;
+}
+
+// Decode the n-th (0-based) FRAME BDU of an Advanced-Profile (WVC1) elementary
+// stream into the handle's planes. Walks BDUs from the start, parsing the sequence
+// and entry-point headers as encountered (so per-frame state is correct), unescapes
+// each payload, and decodes the target I-frame. The handle must be opened at the
+// coded size. Returns 0 on success. (Progressive I-frames only for now.)
+KEEP int vc1_decode_adv(int handle, const uint8_t* bytes, int len, int frame_index) {
+    VC1Context* v = (VC1Context*)(intptr_t)handle;
+    if (!v || len <= 0) return VC1_ERR;
+    uint8_t* scratch = (uint8_t*)malloc((size_t)len + 8);
+    if (!scratch) return VC1_ERR;
+
+    const uint8_t* endp = bytes + len;
+    const uint8_t* start = vc1_find_next_marker(bytes, endp);
+    int seen_frames = 0, rc = VC1_ERR;
+
+    while (start < endp) {
+        const uint8_t* next = vc1_find_next_marker(start + 4, endp);
+        int size = (int)(next - start - 4);
+        if (size > 0) {
+            int usize = vc1_unescape_buffer(start + 4, size, scratch);
+            memset(scratch + usize, 0, 8);
+            int type = start[3];
+            mp4::GetBits gb;
+            mp4::init_get_bits(&gb, scratch, usize);
+            if (type == 0x0F) {                            // SEQHDR
+                v->profile = (int)mp4::get_bits(&gb, 2);
+                if (v->profile != PROFILE_ADVANCED ||
+                    vc1_decode_sequence_header_adv(v, &gb) != VC1_OK) { rc = VC1_ERR; break; }
+            } else if (type == 0x0E) {                     // ENTRYPOINT
+                if (vc1_decode_entry_point(v, &gb) != VC1_OK) { rc = VC1_ERR; break; }
+            } else if (type == 0x0D) {                     // FRAME
+                if (seen_frames == frame_index) {
+                    if (vc1_parse_frame_header_adv(v, &gb) != VC1_OK ||
+                        v->pict_type != PICT_I) { rc = VC1_ERR; break; }
+                    rc = vc1_decode_i_frame_adv(v, &gb);
+                    break;
+                }
+                seen_frames++;
+            }
+        }
+        start = next;
+    }
+    free(scratch);
+    return rc;
 }
 
 KEEP int vc1_coded_h(int handle) { return ((VC1Context*)(intptr_t)handle)->codedH; }

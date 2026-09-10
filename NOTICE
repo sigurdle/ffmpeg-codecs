@@ -1,5 +1,5 @@
-ffmpeg-codecs — video decoders derived from FFmpeg
-==================================================
+ffmpeg-codecs — video and audio decoders derived from FFmpeg
+=============================================================
 
 The C/C++ sources in this repository were transcribed / ported from FFmpeg's
 libavcodec (release/8.1) and are therefore derivative works of FFmpeg, licensed
@@ -21,6 +21,13 @@ Decoder → corresponding FFmpeg libavcodec source
   retrovideo/  Cinepak, MS Video-1,         cinepak.c, msvideo1.c, indeo2/3.c, ivi.c, indeo4/5.c
                Intel Indeo 2/3/4/5
   svq3/        Sorenson Video 3 (SVQ3)      svq3.c (+ shared H.264 machinery)
+  ac3/         AC-3 / Dolby Digital         ac3dec.c, ac3dec_float.c, ac3.c, ac3tab.c,
+               (ATSC A/52) audio            ac3dsp.c, ac3dec_data.c, ac3_parser.c,
+                                            kbdwin.c, libavutil/{lfg,float_dsp}.c
+  mpegaudio/   MPEG-1/2/2.5 audio,          mpegaudiodec_template.c, mpegaudiodec_float.c,
+               Layers I, II and III         mpegaudiodec_common.c, mpegaudiodecheader.c,
+               (MP1 / MP2 / MP3)            mpegaudiodata.c, mpegaudiodsp*.c,
+                                            dct32_template.c
 
 Each source file also carries a one-line provenance header naming the FFmpeg
 file(s) it was transcribed from.

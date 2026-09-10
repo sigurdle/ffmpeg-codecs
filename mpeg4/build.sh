@@ -7,6 +7,11 @@
 # of mpeg4_decode.cpp) — kept in its OWN wasm binary, separate from the author's
 # MPEG-1/2 + Sorenson kernels.
 #
+# NOTE (2026-08-02): the paragraph below was wrong. Smart App Control IS enforced
+# here (VerifiedAndReputablePolicyState=1), but wasm-opt.exe runs fine under it —
+# verified by running it. So the link is NOT pinned to -O0 any more: LINK_OPT
+# (default -O3) lets Binaryen run, which is ~12% SMALLER at identical decode speed.
+# Measured on JPEG: TU -O3/link -O0 = 582KB, TU -O3/link -O3 = 511KB, 0.999x speed.
 # Same Smart App Control / Binaryen workaround as plugins/vp6/build.sh and
 # plugins/mpeg/build.sh: clang (allowed by SAC) optimizes at -O3/-Oz; the link
 # runs at -O0 (no wasm-opt/metadce) and wasm-ld --gc-sections strips unreferenced
@@ -28,6 +33,11 @@ set -euo pipefail
 HERE_W="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -W)"
 EMSDK_DIR="${EMSDK_DIR:-/d/dev/tools/emsdk}"
 OPT="${OPT:--O3}"
+# Link-time optimization level — this is the step that runs Binaryen (wasm-opt).
+# It used to be pinned to -O0 because Smart App Control was thought to block the
+# unsigned Binaryen binaries; measured 2026-08-02, wasm-opt runs fine under SAC
+# (enforced, state 1) and -O3 linking is ~12% smaller at identical decode speed.
+LINK_OPT="${LINK_OPT:--O3}"
 
 EMSDK_W="$(cd "$EMSDK_DIR" && pwd -W)"
 PYBIN="$(ls "$EMSDK_DIR"/python/*/python.exe | head -1)"
@@ -44,7 +54,7 @@ emcc $OPT -msimd128 -fwrapv -ffunction-sections -fdata-sections -fno-exceptions 
 
 EXPORTS=_mp4v_open,_mp4v_close,_mp4v_reset,_mp4v_decode_frame,_mp4v_y_ptr,_mp4v_u_ptr,_mp4v_v_ptr,_mp4v_set_simd,_mp4v_test_idct,_mp4v_test_idct_simd,_mp4v_ref_idct,_mp4v_test_qpel,_mp4v_test_getbits,_mp4v_test_vlc,_mp4v_test_rlvlc,_malloc,_free
 
-LINK_COMMON=( -O0 -Wl,--gc-sections -sMALLOC=emmalloc -sFILESYSTEM=0
+LINK_COMMON=( $LINK_OPT -Wl,--gc-sections -sMALLOC=emmalloc -sFILESYSTEM=0
               -sALLOW_MEMORY_GROWTH=1
               -sMODULARIZE=1 -sEXPORT_ES6=1
               -sEXPORTED_RUNTIME_METHODS=HEAPU8,HEAPU32 --no-entry )

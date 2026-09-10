@@ -86,8 +86,27 @@ struct VC1Context {
     int mv_mode, mv_mode2, lumscale, lumshift;
     int mv_table_index, cbptab;
     int ttmbf, ttfrm;
-    int dquantfrm, dqprofile, dqsbedge, dqbilevel;
+    int dquantfrm, dqprofile, dqsbedge, dqbilevel, altpq;
     int c_ac_table_index, y_ac_table_index, dc_table_index;
+
+    // ── Advanced Profile (WVC1) — sequence + entry-point + frame header ──────────
+    // Sequence header (decode_sequence_header_adv). res_rtm_flag reused from above.
+    int level, chromaformat, postprocflag;
+    int max_coded_width, max_coded_height;
+    int broadcast, interlace, tfcntrflag, psf;
+    int hrd_param_flag, hrd_num_leaky_buckets;
+    // Entry-point header (ff_vc1_decode_entry_point). dquant/vstransform/overlap/
+    // quantizer_mode/fastuvmc/extended_mv/loop_filter reused from the Simple/Main set.
+    int broken_link, closed_entry, panscanflag, refdist_flag, extended_dmv;
+    int range_mapy_flag, range_mapy, range_mapuv_flag, range_mapuv;
+    // Frame header (ff_vc1_parse_frame_header_adv), progressive subset.
+    int fcm, rptfrm, tff, rff, uvsamp, condover;
+    int postproc, p_frame_skipped;
+    int acpred_is_raw, acpred_imode, acpred_invert;
+    int overflg_is_raw;
+    uint8_t* acpred_plane;       // mb_stride * mb_height (per-MB AC-pred flag, AP I)
+    uint8_t* over_flags_plane;   // mb_stride * mb_height (condover SELECT)
+    int16_t* qscale_table;       // mb_stride * mb_height (per-MB mquant, signed; dqscale pred)
 
     // Bitplane state / results (last parsed frame).
     int mv_type_is_raw, skip_is_raw;
@@ -278,6 +297,117 @@ static inline int vc1_decode_sequence_header(VC1Context* v, mp4::GetBits* gb) {
     v->res_rtm_flag = (int)mp4::get_bits1(gb);
     if (!v->res_fasttx) mp4::skip_bits(gb, 16);            // reserved (always 0x402F)
     return VC1_OK;
+}
+
+// FrameCodingMode (vc1.h) and CondOver possibilities.
+enum { PROGRESSIVE = 0, ILACE_FRAME = 1, ILACE_FIELD = 2 };
+enum { CONDOVER_NONE = 0, CONDOVER_ALL = 1, CONDOVER_SELECT = 2 };
+
+// decode_sequence_header_adv (vc1.c:385) — Advanced Profile (WVC1) sequence header.
+// Called after the profile==ADVANCED discriminator; consumes all display-info / HRD
+// bits so the entry-point BDU that follows is bit-aligned. Progressive 4:2:0 only.
+static inline int vc1_decode_sequence_header_adv(VC1Context* v, mp4::GetBits* gb) {
+    v->res_rtm_flag  = 1;
+    v->level         = (int)mp4::get_bits(gb, 3);
+    v->chromaformat  = (int)mp4::get_bits(gb, 2);
+    if (v->chromaformat != 1) return VC1_ERR;              // only 4:2:0 supported
+    v->frmrtq_postproc = (int)mp4::get_bits(gb, 3);
+    v->bitrtq_postproc = (int)mp4::get_bits(gb, 5);
+    v->postprocflag    = (int)mp4::get_bits1(gb);
+    v->max_coded_width  = ((int)mp4::get_bits(gb, 12) + 1) << 1;
+    v->max_coded_height = ((int)mp4::get_bits(gb, 12) + 1) << 1;
+    v->broadcast   = (int)mp4::get_bits1(gb);
+    v->interlace   = (int)mp4::get_bits1(gb);
+    v->tfcntrflag  = (int)mp4::get_bits1(gb);
+    v->finterpflag = (int)mp4::get_bits1(gb);
+    mp4::skip_bits(gb, 1);                                 // reserved
+    v->psf = (int)mp4::get_bits1(gb);
+    if (v->psf) return VC1_ERR;                            // PsF — not supported
+    v->max_b_frames = 7;
+    if (mp4::get_bits1(gb)) {                              // Display Info (decode-irrelevant)
+        int ar = 0;
+        mp4::skip_bits(gb, 14);                            // display width  - 1
+        mp4::skip_bits(gb, 14);                            // display height - 1
+        if (mp4::get_bits1(gb)) ar = (int)mp4::get_bits(gb, 4);
+        if (ar == 15) mp4::skip_bits(gb, 16);             // custom SAR (8+8); table cases read nothing
+        if (mp4::get_bits1(gb)) {                          // framerate
+            if (mp4::get_bits1(gb)) mp4::skip_bits(gb, 16);           // fr num (32nds)
+            else { mp4::skip_bits(gb, 8); mp4::skip_bits(gb, 4); }    // fr nr + dr
+        }
+        if (mp4::get_bits1(gb)) mp4::skip_bits(gb, 24);   // color_prim/transfer/matrix (8+8+8)
+    }
+    v->hrd_param_flag = (int)mp4::get_bits1(gb);
+    if (v->hrd_param_flag) {
+        v->hrd_num_leaky_buckets = (int)mp4::get_bits(gb, 5);
+        mp4::skip_bits(gb, 8);                             // bitrate + buffer size exponents (4+4)
+        for (int i = 0; i < v->hrd_num_leaky_buckets; i++)
+            mp4::skip_bits(gb, 32);                        // hrd_rate[n] + hrd_buffer[n] (16+16)
+    }
+    return VC1_OK;
+}
+
+// ff_vc1_decode_entry_point (vc1.c:493) — Advanced Profile entry-point header.
+// Sets the runtime frame dimensions (coded-size override, else max_coded_*).
+static inline int vc1_decode_entry_point(VC1Context* v, mp4::GetBits* gb) {
+    v->broken_link    = (int)mp4::get_bits1(gb);
+    v->closed_entry   = (int)mp4::get_bits1(gb);
+    v->panscanflag    = (int)mp4::get_bits1(gb);
+    v->refdist_flag   = (int)mp4::get_bits1(gb);
+    v->loop_filter    = (int)mp4::get_bits1(gb);
+    v->fastuvmc       = (int)mp4::get_bits1(gb);
+    v->extended_mv    = (int)mp4::get_bits1(gb);
+    v->dquant         = (int)mp4::get_bits(gb, 2);
+    v->vstransform    = (int)mp4::get_bits1(gb);
+    v->overlap        = (int)mp4::get_bits1(gb);
+    v->quantizer_mode = (int)mp4::get_bits(gb, 2);
+    if (v->hrd_param_flag)
+        for (int i = 0; i < v->hrd_num_leaky_buckets; i++)
+            mp4::skip_bits(gb, 8);                         // hrd_full[n]
+    int w, h;
+    if (mp4::get_bits1(gb)) {                              // coded-size override
+        w = ((int)mp4::get_bits(gb, 12) + 1) << 1;
+        h = ((int)mp4::get_bits(gb, 12) + 1) << 1;
+    } else {
+        w = v->max_coded_width;
+        h = v->max_coded_height;
+    }
+    v->width = w; v->height = h;
+    if (v->extended_mv)
+        v->extended_dmv = (int)mp4::get_bits1(gb);
+    if ((v->range_mapy_flag = (int)mp4::get_bits1(gb)))
+        v->range_mapy = (int)mp4::get_bits(gb, 3);         // parsed, NOT applied (matches ffmpeg)
+    if ((v->range_mapuv_flag = (int)mp4::get_bits1(gb)))
+        v->range_mapuv = (int)mp4::get_bits(gb, 3);
+    return VC1_OK;
+}
+
+// ── Advanced Profile bitstream framing (BDUs, start codes, EBDU) ─────────────────
+// VC-1 AP wraps sequence/entry-point/frame data in BDUs delimited by 4-byte start
+// codes (00 00 01 xx). find_next_marker (vc1_common.h) returns the start of the next
+// 00 00 01 prefix at or after src (the marker value is 0x000001xx, xx = BDU type).
+static inline const uint8_t* vc1_find_next_marker(const uint8_t* src, const uint8_t* end) {
+    for (; src + 4 <= end; src++)
+        if (src[0] == 0 && src[1] == 0 && src[2] == 1) return src;
+    return end;
+}
+
+// vc1_unescape_buffer (vc1_common.h) — strip emulation-prevention bytes: a 0x03 that
+// follows 00 00 and precedes a byte < 4 was inserted to avoid a false start code.
+static inline int vc1_unescape_buffer(const uint8_t* src, int size, uint8_t* dst) {
+    int dsize = 0, i;
+    if (size < 4) {
+        for (dsize = 0; dsize < size; dsize++) *dst++ = *src++;
+        return size;
+    }
+    for (i = 0; i < size; i++, src++) {
+        if (src[0] == 3 && i >= 2 && !src[-1] && !src[-2] && i < size - 1 && src[1] < 4) {
+            dst[dsize++] = src[1];
+            src++; i++;
+        } else {
+            dst[dsize++] = *src;
+        }
+    }
+    return dsize;
 }
 
 // ── Bitplane decoding (vc1.c decode_rowskip / decode_colskip / bitplane_decoding) ─
@@ -523,6 +653,136 @@ static inline int vc1_parse_frame_header(VC1Context* v, mp4::GetBits* gb) {
     return VC1_OK;
 }
 
+// enum DQProfile (vc1.h).
+enum { DQPROFILE_FOUR_EDGES = 0, DQPROFILE_DOUBLE_EDGES, DQPROFILE_SINGLE_EDGE, DQPROFILE_ALL_MBS };
+
+// vop_dquant_decoding (vc1.c:228) — per-frame differential-quant parameters (dquant!=2).
+static inline void vc1_vop_dquant_decoding(VC1Context* v, mp4::GetBits* gb) {
+    int pqdiff;
+    if (v->dquant != 2) {
+        v->dquantfrm = (int)mp4::get_bits1(gb);
+        if (!v->dquantfrm) return;
+        v->dqprofile = (int)mp4::get_bits(gb, 2);
+        switch (v->dqprofile) {
+        case DQPROFILE_SINGLE_EDGE:
+        case DQPROFILE_DOUBLE_EDGES: v->dqsbedge = (int)mp4::get_bits(gb, 2); break;
+        case DQPROFILE_ALL_MBS:
+            v->dqbilevel = (int)mp4::get_bits1(gb);
+            if (!v->dqbilevel) { v->halfpq = 0; return; }
+            break;
+        default: break;
+        }
+    }
+    pqdiff = (int)mp4::get_bits(gb, 3);
+    v->altpq = (pqdiff == 7) ? (int)mp4::get_bits(gb, 5) : v->pq + pqdiff + 1;
+}
+
+// GET_MQUANT (vc1_block.c:186) — per-MB quantizer for the current (mb_x,mb_y). Reads
+// bits only when dquantfrm && dqprofile==ALL_MBS. Sign of the return is significant
+// (mquant<0 drops the halfpq term in the block dequant). Starts from pq.
+static inline int vc1_get_mquant(VC1Context* v, mp4::GetBits* gb) {
+    int mquant = v->pq;
+    if (v->dquantfrm) {
+        int edges = 0;
+        if (v->dqprofile == DQPROFILE_ALL_MBS) {
+            if (v->dqbilevel) {
+                mquant = mp4::get_bits1(gb) ? -v->altpq : v->pq;
+            } else {
+                int mqdiff = (int)mp4::get_bits(gb, 3);
+                mquant = (mqdiff != 7) ? -v->pq - mqdiff : -(int)mp4::get_bits(gb, 5);
+            }
+        }
+        if (v->dqprofile == DQPROFILE_SINGLE_EDGE)  edges = 1 << v->dqsbedge;
+        else if (v->dqprofile == DQPROFILE_DOUBLE_EDGES) edges = (3 << v->dqsbedge) % 15;
+        else if (v->dqprofile == DQPROFILE_FOUR_EDGES)   edges = 15;
+        if ((edges & 1) && !v->mb_x)                     mquant = -v->altpq;
+        if ((edges & 2) && !v->mb_y)                     mquant = -v->altpq;
+        if ((edges & 4) && v->mb_x == v->mb_width - 1)   mquant = -v->altpq;
+        if ((edges & 8) && v->mb_y == v->mb_height - 1)  mquant = -v->altpq;
+        if (!mquant || mquant > 31 || mquant < -31)      mquant = 1;
+    }
+    return mquant;
+}
+
+// ff_vc1_parse_frame_header_adv (vc1.c:836) — Advanced Profile picture header,
+// PROGRESSIVE I/BI subset (interlace frame/field paths and P/B are elsewhere).
+static inline int vc1_parse_frame_header_adv(VC1Context* v, mp4::GetBits* gb) {
+    int pqindex;
+    vc1_init_vlcs();
+
+    v->p_frame_skipped = 0;
+    int fcm = PROGRESSIVE;
+    if (v->interlace) {
+        fcm = vc1_decode012(gb);
+        if (fcm == ILACE_FIELD) return VC1_ERR;            // field pictures — not yet
+    }
+    v->fcm = fcm;
+
+    switch (vc1_get_unary(gb, 0, 4)) {                     // picture type (progressive)
+    case 0: v->pict_type = PICT_P; break;
+    case 1: v->pict_type = PICT_B; break;
+    case 2: v->pict_type = PICT_I; break;
+    case 3: v->pict_type = PICT_BI; break;
+    default: v->pict_type = PICT_P; v->p_frame_skipped = 1; break;   // 4 = skipped
+    }
+    if (v->pict_type == PICT_B || v->pict_type == PICT_BI)
+        return VC1_ERR;                                    // B/BI — not yet supported
+
+    if (v->tfcntrflag) mp4::skip_bits(gb, 8);
+    if (v->broadcast) {
+        if (!v->interlace || v->psf) v->rptfrm = (int)mp4::get_bits(gb, 2);
+        else { v->tff = (int)mp4::get_bits1(gb); v->rff = (int)mp4::get_bits1(gb); }
+    } else {
+        v->tff = 1;
+    }
+    if (v->panscanflag) return VC1_ERR;                    // pan-scan — not supported
+    if (v->p_frame_skipped) return VC1_OK;
+
+    v->rnd = (int)mp4::get_bits1(gb);
+    if (v->interlace) v->uvsamp = (int)mp4::get_bits1(gb);
+    if (v->fcm == PROGRESSIVE && v->finterpflag)
+        v->interpfrm = (int)mp4::get_bits1(gb);
+
+    // parse_common_info
+    pqindex = (int)mp4::get_bits(gb, 5);
+    if (!pqindex) return VC1_ERR;
+    v->pq = (v->quantizer_mode == QUANT_FRAME_IMPLICIT) ? vc1_pquant_table[0][pqindex]
+                                                        : vc1_pquant_table[1][pqindex];
+    v->pqindex = pqindex;
+    v->halfpq  = (pqindex < 9) ? (int)mp4::get_bits1(gb) : 0;
+    switch (v->quantizer_mode) {
+    case QUANT_FRAME_IMPLICIT: v->pquantizer = pqindex < 9;             break;
+    case QUANT_NON_UNIFORM:    v->pquantizer = 0;                       break;
+    case QUANT_FRAME_EXPLICIT: v->pquantizer = (int)mp4::get_bits1(gb); break;
+    default:                   v->pquantizer = 1;                       break;
+    }
+    v->dquantfrm = 0;
+    if (v->postprocflag) v->postproc = (int)mp4::get_bits(gb, 2);
+
+    // I / BI (progressive frame): ACPRED bitplane, then CONDOVER (overlap only).
+    int status = vc1_bitplane_decoding(v->acpred_plane, &v->acpred_is_raw, v, gb);
+    if (status < 0) return VC1_ERR;
+    v->acpred_imode = status >> 1; v->acpred_invert = status & 1;
+    v->condover = CONDOVER_NONE;
+    if (v->overlap && v->pq <= 8) {
+        v->condover = vc1_decode012(gb);
+        if (v->condover == CONDOVER_SELECT) {
+            status = vc1_bitplane_decoding(v->over_flags_plane, &v->overflg_is_raw, v, gb);
+            if (status < 0) return VC1_ERR;
+        }
+    }
+
+    // AC syntax (TRANSACFRM / TRANSACFRM2) — I/BI reads both Y and C indices.
+    v->c_ac_table_index = vc1_decode012(gb);
+    if (v->pict_type == PICT_I || v->pict_type == PICT_BI)
+        v->y_ac_table_index = vc1_decode012(gb);
+    // DC syntax (TRANSDCTAB) + VOPDQUANT (I/BI when entry-point dquant set).
+    v->dc_table_index = (int)mp4::get_bits1(gb);
+    if ((v->pict_type == PICT_I || v->pict_type == PICT_BI) && v->dquant)
+        vc1_vop_dquant_decoding(v, gb);
+    return VC1_OK;
+}
+
 // ── I-frame block decode (Simple/Main) ──────────────────────────────────────────
 // Grid geometry mirrors the msmpeg4 port (ff_mpv_common_init): dc/ac/coded grids
 // offset by lead+dc_off so edge OOB neighbour reads land in a zeroed guard.
@@ -753,15 +1013,36 @@ static inline void vc1_put_pixels_clamped(const int16_t* block, uint8_t* dst, in
     }
 }
 
-static inline void vc1_put_mb(VC1Context* v, int16_t block[6][64]) {
+// put_signed_pixels_clamped (idsp.c) — reconstruct SIGNED residual blocks (+128).
+// Advanced Profile intra ALWAYS uses this (vc1_put_blocks_clamped(v,1)); Simple/Main
+// I uses the unsigned put (v,0) because its DC predictor carries the +128*8 default.
+static inline void vc1_put_signed_pixels_clamped(const int16_t* block, uint8_t* dst, int stride) {
+    for (int i = 0; i < 8; i++) {
+        for (int j = 0; j < 8; j++) {
+            int x = block[j] + 128;
+            dst[j] = (uint8_t)(x < 0 ? 0 : (x > 255 ? 255 : x));
+        }
+        block += 8; dst += stride;
+    }
+}
+
+// put_mb: `sgn` selects put_signed_pixels_clamped (+128, Advanced) vs plain (Simple/Main).
+static inline void vc1_put_mb(VC1Context* v, int16_t block[6][64], int sgn = 0) {
     int ys = v->yStride, cs = v->cStride;
     uint8_t* yb = v->planeY + (size_t)(v->mb_y * 16) * ys + v->mb_x * 16;
-    for (int i = 0; i < 4; i++)
-        vc1_put_pixels_clamped(block[i], yb + ((i & 2) >> 1) * 8 * ys + (i & 1) * 8, ys);
     uint8_t* ub = v->planeU + (size_t)(v->mb_y * 8) * cs + v->mb_x * 8;
     uint8_t* vb = v->planeV + (size_t)(v->mb_y * 8) * cs + v->mb_x * 8;
-    vc1_put_pixels_clamped(block[4], ub, cs);
-    vc1_put_pixels_clamped(block[5], vb, cs);
+    if (sgn) {
+        for (int i = 0; i < 4; i++)
+            vc1_put_signed_pixels_clamped(block[i], yb + ((i & 2) >> 1) * 8 * ys + (i & 1) * 8, ys);
+        vc1_put_signed_pixels_clamped(block[4], ub, cs);
+        vc1_put_signed_pixels_clamped(block[5], vb, cs);
+    } else {
+        for (int i = 0; i < 4; i++)
+            vc1_put_pixels_clamped(block[i], yb + ((i & 2) >> 1) * 8 * ys + (i & 1) * 8, ys);
+        vc1_put_pixels_clamped(block[4], ub, cs);
+        vc1_put_pixels_clamped(block[5], vb, cs);
+    }
 }
 
 // ── In-loop deblocking filter (vc1dsp.c / vc1_loopfilter.c), Simple/Main I-frame ──
@@ -1009,6 +1290,193 @@ static inline int vc1_decode_intra_block_p(VC1Context* v, int16_t block[64], int
         }
     }
     return 0;
+}
+
+// ff_vc1_pred_dc (vc1_block.c:408) — full DC predictor with per-MB dqscale rescaling
+// of the neighbours (needed when dquantfrm makes adjacent MBs use different mquant).
+static inline int vc1_pred_dc_adv(VC1Context* v, int n, int a_avail, int c_avail,
+                                  int16_t** dc_val_ptr, int* dir_ptr) {
+    int mb_pos = v->mb_x + v->mb_y * v->mb_stride;
+    int q1 = abs(v->qscale_table[mb_pos]);
+    int dqscale_index = ff_wmv3_dc_scale_table[q1] - 1;
+    if (dqscale_index < 0) return 0;
+    int wrap = v->block_wrap[n];
+    int16_t* dc_val = v->dc_val + v->block_index[n];
+    int c = dc_val[-1], b = dc_val[-1 - wrap], a = dc_val[-wrap], q2 = 0, pred;
+    if (c_avail && (n != 1 && n != 3)) {
+        q2 = abs(v->qscale_table[mb_pos - 1]);
+        if (q2 && q2 != q1)
+            c = (int)((unsigned)c * ff_wmv3_dc_scale_table[q2] * ff_vc1_dqscale[dqscale_index] + 0x20000) >> 18;
+    }
+    if (a_avail && (n != 2 && n != 3)) {
+        q2 = abs(v->qscale_table[mb_pos - v->mb_stride]);
+        if (q2 && q2 != q1)
+            a = (int)((unsigned)a * ff_wmv3_dc_scale_table[q2] * ff_vc1_dqscale[dqscale_index] + 0x20000) >> 18;
+    }
+    if (a_avail && c_avail && (n != 3)) {
+        int off = mb_pos;
+        if (n != 1) off--;
+        if (n != 2) off -= v->mb_stride;
+        q2 = abs(v->qscale_table[off]);
+        if (q2 && q2 != q1)
+            b = (int)((unsigned)b * ff_wmv3_dc_scale_table[q2] * ff_vc1_dqscale[dqscale_index] + 0x20000) >> 18;
+    }
+    if (c_avail && (!a_avail || abs(a - b) <= abs(b - c))) { pred = c; *dir_ptr = 1; }
+    else if (a_avail)                                      { pred = a; *dir_ptr = 0; }
+    else                                                  { pred = 0; *dir_ptr = 1; }
+    *dc_val_ptr = dc_val;
+    return pred;
+}
+
+// vc1_decode_i_block_adv (vc1_block.c:708) — Advanced-Profile I-frame intra block.
+// Full version: dqscale-rescaled DC/AC prediction (mquant varies per MB when
+// dquantfrm), adv 8x8 scan by ac_pred/direction. Coeffs land in `block`.
+static inline int vc1_decode_i_block_adv(VC1Context* v, int16_t block[64], int n,
+                                         int coded, int codingset, int mquant, mp4::GetBits* gb) {
+    int dc_pred_dir = 0;
+    int16_t *dc_val, *ac_val, *ac_val2;
+    int dcdiff, scale, k;
+    int a_avail = v->a_avail, c_avail = v->c_avail, use_pred = v->ac_pred;
+    int quant = mquant < 0 ? -mquant : mquant;
+    int mb_pos = v->mb_x + v->mb_y * v->mb_stride;
+    int q1, q2 = 0;
+
+    dcdiff = msm::msm_dc_vlc(gb, msm::ff_msmp4_dc_tables[v->dc_table_index][n >= 4 ? 1 : 0]);
+    if (dcdiff < 0) return VC1_ERR;
+    if (dcdiff) {
+        const int m = (quant == 1 || quant == 2) ? 3 - quant : 0;
+        if (dcdiff == 119) dcdiff = (int)mp4::get_bits(gb, 8 + m);
+        else if (m)        dcdiff = (dcdiff << m) + (int)mp4::get_bits(gb, m) - ((1 << m) - 1);
+        if (mp4::get_bits1(gb)) dcdiff = -dcdiff;
+    }
+    dcdiff += vc1_pred_dc_adv(v, n, a_avail, c_avail, &dc_val, &dc_pred_dir);
+    *dc_val  = (int16_t)dcdiff;
+    block[0] = (int16_t)(dcdiff * v->y_dc_scale);
+
+    if (!a_avail && !c_avail) use_pred = 0;
+    scale = quant * 2 + (mquant < 0 ? 0 : v->halfpq);
+    ac_val  = v->ac_val + (size_t)v->block_index[n] * 16;
+    ac_val2 = ac_val;
+    if (dc_pred_dir) ac_val -= 16;
+    else             ac_val -= 16 * v->block_wrap[n];
+
+    q1 = v->qscale_table[mb_pos];
+    if (n == 3) q2 = q1;
+    else if (dc_pred_dir) {
+        if (n == 1) q2 = q1;
+        else if (c_avail && mb_pos) q2 = v->qscale_table[mb_pos - 1];
+    } else {
+        if (n == 2) q2 = q1;
+        else if (a_avail && mb_pos >= v->mb_stride) q2 = v->qscale_table[mb_pos - v->mb_stride];
+    }
+
+    if (coded) {
+        int last = 0, skip, value;
+        const uint8_t* zz = v->ac_pred ? (dc_pred_dir ? v->zz_8x8[3] : v->zz_8x8[2]) : v->zz_8x8[1];
+        for (int i = 1; !last; ++i) {
+            if (vc1_decode_ac_coeff(v, &last, &skip, &value, codingset, gb) < 0) return VC1_ERR;
+            i += skip;
+            if (i > 63) break;
+            block[zz[i]] = (int16_t)value;
+        }
+        if (use_pred) {
+            int sh;
+            if (dc_pred_dir) sh = v->left_blk_sh;
+            else            { sh = v->top_blk_sh; ac_val += 8; }
+            q1 = (q1 < 0 ? -q1 : q1) * 2 + (q1 < 0 ? 0 : v->halfpq) - 1;
+            if (q1 < 1) return VC1_ERR;
+            if (q2) q2 = (q2 < 0 ? -q2 : q2) * 2 + (q2 < 0 ? 0 : v->halfpq) - 1;
+            if (q2 && q1 != q2)
+                for (k = 1; k < 8; k++)
+                    block[k << sh] += (int)(ac_val[k] * (unsigned)q2 * ff_vc1_dqscale[q1 - 1] + 0x20000) >> 18;
+            else
+                for (k = 1; k < 8; k++) block[k << sh] += ac_val[k];
+        }
+        for (k = 1; k < 8; k++) {
+            ac_val2[k]     = block[k << v->left_blk_sh];
+            ac_val2[k + 8] = block[k << v->top_blk_sh];
+        }
+        for (k = 1; k < 64; k++) if (block[k]) {
+            block[k] *= scale;
+            if (!v->pquantizer) block[k] += (block[k] < 0) ? -quant : quant;
+        }
+    } else {
+        memset(ac_val2, 0, 16 * 2);
+        if (use_pred) {
+            int sh;
+            if (dc_pred_dir) sh = v->left_blk_sh;
+            else            { sh = v->top_blk_sh; ac_val += 8; ac_val2 += 8; }
+            memcpy(ac_val2, ac_val, 8 * 2);
+            q1 = (q1 < 0 ? -q1 : q1) * 2 + (q1 < 0 ? 0 : v->halfpq) - 1;
+            if (q1 < 1) return VC1_ERR;
+            if (q2) q2 = (q2 < 0 ? -q2 : q2) * 2 + (q2 < 0 ? 0 : v->halfpq) - 1;
+            if (q2 && q1 != q2)
+                for (k = 1; k < 8; k++)
+                    ac_val2[k] = (int)(ac_val2[k] * q2 * (unsigned)ff_vc1_dqscale[q1 - 1] + 0x20000) >> 18;
+            for (k = 1; k < 8; k++) {
+                block[k << sh] = ac_val2[k] * scale;
+                if (!v->pquantizer && block[k << sh])
+                    block[k << sh] += (block[k << sh] < 0) ? -quant : quant;
+            }
+        }
+    }
+    return VC1_OK;
+}
+
+// vc1_decode_i_blocks_adv (vc1_block.c:2619) — Advanced-Profile PROGRESSIVE I-frame.
+// Mirrors the Simple/Main vc1_decode_i_frame but: ac_pred comes from the ACPRED
+// bitplane (not a per-MB bit), a_avail/c_avail drive the DC/AC predictor per block,
+// mquant == pq (dquantfrm==0 for I-frames), and blocks use the adv scan (iadv=1).
+// overlap==0 in the target stream so the overlap smoothing / condover pass is skipped.
+static inline int vc1_decode_i_frame_adv(VC1Context* v, mp4::GetBits* gb) {
+    vc1_init_iframe_tables();
+
+    switch (v->y_ac_table_index) {
+    case 0: v->codingset = (v->pqindex <= 8) ? CS_HIGH_RATE_INTRA : CS_LOW_MOT_INTRA; break;
+    case 1: v->codingset = CS_HIGH_MOT_INTRA; break;
+    case 2: v->codingset = CS_MID_RATE_INTRA; break;
+    }
+    switch (v->c_ac_table_index) {
+    case 0: v->codingset2 = (v->pqindex <= 8) ? CS_HIGH_RATE_INTER : CS_LOW_MOT_INTER; break;
+    case 1: v->codingset2 = CS_HIGH_MOT_INTER; break;
+    case 2: v->codingset2 = CS_MID_RATE_INTER; break;
+    }
+    v->esc3_level_length = 0;
+
+    memset(v->dc_base, 0, (size_t)v->grid_total * sizeof(int16_t));
+    memset(v->ac_base, 0, (size_t)v->grid_total * 16 * sizeof(int16_t));
+    memset(v->coded_base, 0, (size_t)v->grid_total);
+
+    for (v->mb_y = 0; v->mb_y < v->mb_height; v->mb_y++) {
+        v->first_slice_line = (v->mb_y == 0);
+        for (v->mb_x = 0; v->mb_x < v->mb_width; v->mb_x++) {
+            vc1_init_block_index(v);
+            int16_t block[6][64];
+            memset(block, 0, sizeof(block));
+            int mb_pos = v->mb_x + v->mb_y * v->mb_stride;
+
+            int cbp = mp4::get_vlc2(gb, g_mb_i.table, g_mb_i.bits);
+            if (cbp < 0) return VC1_ERR;
+            v->ac_pred = v->acpred_is_raw ? (int)mp4::get_bits1(gb) : v->acpred_plane[mb_pos];
+            int mquant = vc1_get_mquant(v, gb);
+            v->qscale_table[mb_pos] = (int16_t)mquant;               // dqscale neighbour lookup
+            v->y_dc_scale = ff_wmv3_dc_scale_table[mquant < 0 ? -mquant : mquant];
+
+            for (int k = 0; k < 6; k++) {
+                int val = (cbp >> (5 - k)) & 1;
+                if (k < 4) val = vc1_coded_block_pred(v, k, val);
+                v->a_avail = !v->first_slice_line || (k == 2 || k == 3);
+                v->c_avail = (v->mb_x != 0)        || (k == 1 || k == 3);
+                int ret = vc1_decode_i_block_adv(v, block[k], k, val,
+                                                 (k < 4) ? v->codingset : v->codingset2, mquant, gb);
+                if (ret < 0) return ret;
+                vc1_inv_trans_8x8(block[k]);
+            }
+            vc1_put_mb(v, block, /*sgn=*/1);   // Advanced intra: put_signed (+128)
+        }
+    }
+    if (v->loop_filter) vc1_i_deblock_frame(v);
+    return VC1_OK;
 }
 
 // vc1_decode_p_block — inter residual, variable transform sizes; adds to `dst`.
