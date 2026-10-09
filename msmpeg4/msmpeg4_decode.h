@@ -1,23 +1,24 @@
 /*
     Microsoft MPEG-4 / Windows Media Video 7-8 (WMV1/WMV2, a.k.a. msmpeg4 v1-v3 +
-    WMV1) video decoder — C++/WebAssembly. From-source TRANSCRIPTION of FFmpeg
+    WMV1/WMV2) video decoder — C++/WebAssembly. From-source TRANSCRIPTION of FFmpeg
     release/8.1's msmpeg4 decoder (libavcodec/msmpeg4dec.c, msmpeg4.c,
-    msmpeg4data.c, msmpeg4_vc1_data.c). FFmpeg is LGPL-2.1+; this is an LGPL-derived
-    work in its OWN wasm binary. Conformance oracle is the ffmpeg CLI
-    (`ffmpeg -i sample -f rawvideo -pix_fmt yuv420p`), NOT any ffmpeg-derived JS.
+    msmpeg4data.c, msmpeg4_vc1_data.c) and, for WMV2, wmv2dec.c / wmv2dsp.c /
+    intrax8.c / intrax8dsp.c / h263.c (loop filter) — see wmv2_decode.h. FFmpeg is
+    LGPL-2.1+; this is an LGPL-derived work in its OWN wasm binary. Conformance oracle
+    is the ffmpeg CLI (`ffmpeg -cpuflags 0 -i sample -f rawvideo -pix_fmt yuv420p`),
+    NOT any ffmpeg-derived JS.
 
     msmpeg4 is "MPEG-4 with a twist": it reuses the H.263/mpegvideo block machinery
-    (8x8 DCT blocks, H.263 dequant, simple_idct8, DC/AC intra prediction, the same
-    macroblock grid geometry) but with Microsoft's own picture header, VLC tables,
-    DC prediction and coefficient escapes. This module REUSES the kernels the sibling
-    mpeg4 port ships — get_bits (mp4_bits.h), the VLC/RL runtime (mp4_vlc.h) and
-    simple_idct8.h — plus that port's grid layout, and adds the msmpeg4 layer.
+    (8x8 DCT blocks, H.263 dequant, DC/AC intra prediction, the same macroblock grid
+    geometry) but with Microsoft's own picture header, VLC tables, DC prediction and
+    coefficient escapes. This module REUSES the kernels the sibling mpeg4 port ships —
+    get_bits (mp4_bits.h), the VLC/RL runtime (mp4_vlc.h) and simple_idct8.h — plus
+    that port's grid layout, and adds the msmpeg4 layer.
 
-    STATUS: milestone-staged. Lands WMV1 (MSMP4_WMV1) I-frame intra decode: picture
-    header, MB-type + coded-block-pattern prediction, DC (VLC + ffmpeg DC predictor),
-    AC (RL-VLC + three coefficient escapes) with AC prediction, H.263 intra dequant,
-    IDCT and reconstruction — plane-compared against the ffmpeg oracle. P-frame inter
-    (motion vectors + MC) and WMV2 follow.
+    This file holds the WMV1 picture header and the I/P macroblock layer that WMV2
+    shares (block decode, DC/AC prediction, MV decode, half-pel MC). WMV2 replaces
+    the picture header and MB layer, the IDCT, and adds mspel MC, ABT, the H.263 loop
+    filter and IntraX8 J-frames (wmv2_decode.h, wmv2_dsp.h, intrax8.h).
 
     -fwrapv is REQUIRED (dequant / sign arithmetic), same as the mpeg4 port.
 */
@@ -32,6 +33,8 @@
 #include "../mpeg4/mp4_bits.h"       // get_bits reader (namespace mp4)
 #include "../mpeg4/simple_idct8.h"   // mp4::idct8_put
 #include "msmpeg4_tables.h"          // msm:: tables + VLC/RL builders
+#include "wmv2_dsp.h"                // WMV2 IDCT / ABT / mspel / H.263 loop filter
+#include "intrax8.h"                 // IntraX8 (WMV2 J-frames)
 
 namespace msm {
 
@@ -62,7 +65,7 @@ struct MsmDecoder {
 
     // Frame-persistent prediction grids (mpeg4-port geometry: dc_val int16 grid,
     // ac_val 16 int16 per block, coded_block uint8 grid, motion_val 2 int16 per
-    // block — all offset by lead+dc_off so edge OOB neighbour reads land in a guard).
+    // block — all offset by lead+dc_off so edge OOB neighbor reads land in a guard).
     int dc_off, grid_elems, grid_lead;
     int16_t *dc_base, *dc_val;
     int16_t *ac_base, *ac_val;
@@ -86,6 +89,15 @@ struct MsmDecoder {
     mp4::VlcTab mv_tab[2];            // P-frame motion-vector VLCs (mv_table_index)
     mp4::VlcTab inter_intra;         // h263_aic_dir VLC (inter_intra_pred)
     int inter_qscale;                 // qscale rl_inter was last built for
+
+    // WMV2 (version == MSMP4_WMV2). Extradata flags (decode_ext_header), then the
+    // per-picture / per-MB state of wmv2dec.c's WMV2DecContext.
+    int mspel_bit, loop_filter, abt_flag, j_type_bit, top_left_mv_flag, per_mb_rl_bit;
+    int j_type, mspel, cbp_table_index, hshift;
+    int abt_type, per_mb_abt, per_block_abt, abt_type_table[6];
+    int16_t abt_block2[6][64];
+    uint8_t* mb_skip;                 // per-MB skip flag (MB_TYPE_SKIP), mb_stride * mb_height
+    IntraX8Context x8;
 };
 
 // ff_h263-style ternary field: 0 -> 1 bit '0'; else 1 bit '1' + 1 bit (+1).
@@ -184,6 +196,12 @@ static inline int msm_alloc(MsmDecoder* d) {
     d->mot_val     = d->mot_base   + (size_t)(lead + d->dc_off) * 2;
     d->coded_block = d->coded_base + lead + d->dc_off;
 
+    if (d->version == MSMP4_WMV2) {
+        free(d->mb_skip);
+        d->mb_skip = (uint8_t*)calloc((size_t)d->mb_stride * d->mb_height, 1);
+        if (!d->mb_skip || x8_common_init(&d->x8, d->mb_width, d->mb_height) < 0) return MSM_ERR;
+    }
+
     d->block_wrap[0] = d->block_wrap[1] = d->block_wrap[2] = d->block_wrap[3] = d->b8_stride;
     d->block_wrap[4] = d->block_wrap[5] = d->mb_stride;
 
@@ -233,7 +251,16 @@ static inline int msm_coded_block_pred(MsmDecoder* d, int n, uint8_t** ptr) {
     return (b == c) ? a : c;
 }
 
-// ff_msmpeg4_pred_dc (WMV1 = version>V3, inter_intra_pred=0 on I-frames).
+// get_dc (msmpeg4.c): rounded mean of a reconstructed block, in DC-level units.
+static inline int msm_get_dc(const uint8_t* src, int stride, int scale, int block_size) {
+    int sum = 0;
+    for (int y = 0; y < block_size; y++)
+        for (int x = 0; x < block_size; x++)
+            sum += src[x + y * stride];
+    return (sum + (scale >> 1)) / scale;   // FASTDIV
+}
+
+// ff_msmpeg4_pred_dc, WMV1/WMV2 branch (version > V3).
 static inline int msm_pred_dc(MsmDecoder* d, int n, int16_t** dc_val_ptr, int* dir_ptr) {
     int scale = (n < 4) ? d->y_dc_scale : d->c_dc_scale;
     int wrap = d->block_wrap[n];
@@ -243,8 +270,49 @@ static inline int msm_pred_dc(MsmDecoder* d, int n, int16_t** dc_val_ptr, int* d
     b = (b + (scale >> 1)) / scale;
     c = (c + (scale >> 1)) / scale;
     int pred;
-    if (abs(a - b) < abs(b - c)) { pred = c; *dir_ptr = 1; }
-    else                          { pred = a; *dir_ptr = 0; }
+    if (d->inter_intra_pred) {
+        // Intra MB in a WMV1 P-frame (small, low-bitrate streams): blocks 1-3 use a
+        // fixed neighbor; blocks 0/4/5 predict from the pixel DC of the reconstructed
+        // left / top blocks, picked by h263_aic_dir.
+        if (n == 1) {
+            pred = a; *dir_ptr = 0;
+        } else if (n == 2) {
+            pred = c; *dir_ptr = 1;
+        } else if (n == 3) {
+            if (abs(a - b) < abs(b - c)) { pred = c; *dir_ptr = 1; }
+            else                          { pred = a; *dir_ptr = 0; }
+        } else {
+            const int bs = 8;
+            const uint8_t* dest;
+            int pw;
+            if (n < 4) {
+                pw = d->yStride;
+                dest = d->y + (size_t)((n >> 1) + 2 * d->mb_y) * bs * pw + ((n & 1) + 2 * d->mb_x) * bs;
+            } else {
+                pw = d->cStride;
+                dest = (n == 4 ? d->u : d->v) + (size_t)(d->mb_y * bs) * pw + d->mb_x * bs;
+            }
+            if (d->mb_x == 0) a = (1024 + (scale >> 1)) / scale;
+            else              a = msm_get_dc(dest - bs, pw, scale * 8, bs);
+            if (d->mb_y == 0) c = (1024 + (scale >> 1)) / scale;
+            else              c = msm_get_dc(dest - bs * pw, pw, scale * 8, bs);
+
+            if (d->h263_aic_dir == 0) {
+                pred = a; *dir_ptr = 0;
+            } else if (d->h263_aic_dir == 1) {
+                if (n == 0) { pred = c; *dir_ptr = 1; }
+                else        { pred = a; *dir_ptr = 0; }
+            } else if (d->h263_aic_dir == 2) {
+                if (n == 0) { pred = a; *dir_ptr = 0; }
+                else        { pred = c; *dir_ptr = 1; }
+            } else {
+                pred = c; *dir_ptr = 1;
+            }
+        }
+    } else {
+        if (abs(a - b) < abs(b - c)) { pred = c; *dir_ptr = 1; }
+        else                          { pred = a; *dir_ptr = 0; }
+    }
     *dc_val_ptr = dc_val;
     return pred;
 }
@@ -280,7 +348,10 @@ static inline void msm_pred_ac(MsmDecoder* d, int16_t* block, int n, int dir) {
 }
 
 // ── block decode — ff_msmpeg4_decode_block (intra + inter) ──────────────────────
-static inline int msm_decode_block(MsmDecoder* d, mp4::GetBits* gb, int16_t* block, int n, int coded, int intra) {
+// `inter_scan` overrides the inter scan (WMV2 ABT passes its 8x4 / 4x8 scans);
+// NULL selects the regular inter scan. Ignored for intra blocks.
+static inline int msm_decode_block(MsmDecoder* d, mp4::GetBits* gb, int16_t* block, int n, int coded, int intra,
+                                   const uint8_t* inter_scan) {
     const mp4::RlTab* rl;
     int qmul, qadd, i, dc_pred_dir = -1;
     if (intra) {
@@ -300,7 +371,7 @@ static inline int msm_decode_block(MsmDecoder* d, mp4::GetBits* gb, int16_t* blo
     if (intra && !coded) goto not_coded;
     {
         const uint8_t* scan_table = intra ? (d->ac_pred ? (dc_pred_dir == 0 ? d->v_scan : d->h_scan) : d->intra_scan)
-                                          : d->inter_scan;
+                                          : (inter_scan ? inter_scan : d->inter_scan);
         const mp4::RL_VLC_ELEM* rl_vlc = rl->table;
         const int bits = rl->bits;
         for (;;) {
@@ -391,7 +462,8 @@ static inline void msm_reconstruct_mb(MsmDecoder* d) {
             uint8_t* plane = (n == 4) ? d->u : d->v;
             dest = plane + (size_t)(d->mb_y * 8) * stride + d->mb_x * 8;
         }
-        mp4::idct8_put(dest, stride, d->block[n]);
+        if (d->version == MSMP4_WMV2) wmv2_idct_put(dest, stride, d->block[n]);   // ff_wmv2dsp_init
+        else                          mp4::idct8_put(dest, stride, d->block[n]);
     }
 }
 
@@ -416,7 +488,7 @@ static inline int msm_decode_mb_intra(MsmDecoder* d, mp4::GetBits* gb) {
     }
     memset(d->block, 0, sizeof(d->block));
     for (int i = 0; i < 6; i++)
-        if (msm_decode_block(d, gb, d->block[i], i, (cbp >> (5 - i)) & 1, 1) < 0) return MSM_ERR;
+        if (msm_decode_block(d, gb, d->block[i], i, (cbp >> (5 - i)) & 1, 1, NULL) < 0) return MSM_ERR;
     return MSM_OK;
 }
 
@@ -557,7 +629,7 @@ static inline int msm_decode_mb_p(MsmDecoder* d, mp4::GetBits* gb) {
     msm_update_motion_val(d);
     memset(d->block, 0, sizeof(d->block));
     for (int i = 0; i < 6; i++)
-        if (msm_decode_block(d, gb, d->block[i], i, (cbp >> (5 - i)) & 1, d->mb_intra) < 0) return MSM_ERR;
+        if (msm_decode_block(d, gb, d->block[i], i, (cbp >> (5 - i)) & 1, d->mb_intra, NULL) < 0) return MSM_ERR;
     return MSM_OK;
 }
 

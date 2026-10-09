@@ -50,7 +50,7 @@ OBJ="$HERE_W/vc1_decode.o"
 echo "compiling vc1 ($OPT)..."
 emcc $OPT -msimd128 -fwrapv -ffunction-sections -fdata-sections -fno-exceptions -fno-rtti -c "$SRC" -o "$OBJ"
 
-EXPORTS=_vc1_open,_vc1_close,_vc1_test_seqhdr,_vc1_test_pichdr,_vc1_test_adv_headers,_vc1_decode_adv,_vc1_decode_iframe,_vc1_decode_pframe,_vc1_seqhdr,_vc1_decode_frame,_vc1_coded_h,_vc1_plane_y,_vc1_plane_u,_vc1_plane_v,_vc1_stride_y,_vc1_stride_c,_malloc,_free
+EXPORTS=_vc1_open,_vc1_close,_vc1_test_seqhdr,_vc1_test_pichdr,_vc1_test_adv_headers,_vc1_decode_adv,_vc1_decode_iframe,_vc1_decode_pframe,_vc1_seqhdr,_vc1_decode_frame,_vc1_pict_type,_vc1_max_b_frames,_vc1_select_output,_vc1_coded_h,_vc1_plane_y,_vc1_plane_u,_vc1_plane_v,_vc1_stride_y,_vc1_stride_c,_malloc,_free
 
 LINK_COMMON=( $LINK_OPT -Wl,--gc-sections -sMALLOC=emmalloc -sFILESYSTEM=0
               -sALLOW_MEMORY_GROWTH=1

@@ -50,7 +50,7 @@ OBJ="$HERE_W/msmpeg4_decode.o"
 echo "compiling msmpeg4 ($OPT)..."
 emcc $OPT -msimd128 -fwrapv -ffunction-sections -fdata-sections -fno-exceptions -fno-rtti -c "$SRC" -o "$OBJ"
 
-EXPORTS=_msm_open,_msm_close,_msm_test_header,_msm_decode,_msm_y_ptr,_msm_u_ptr,_msm_v_ptr,_malloc,_free
+EXPORTS=_msm_open,_msm_close,_msm_extradata,_msm_test_header,_msm_decode,_msm_y_ptr,_msm_u_ptr,_msm_v_ptr,_malloc,_free
 
 LINK_COMMON=( $LINK_OPT -Wl,--gc-sections -sMALLOC=emmalloc -sFILESYSTEM=0
               -sALLOW_MEMORY_GROWTH=1

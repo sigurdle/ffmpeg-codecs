@@ -40,12 +40,28 @@ KEEP int vc1_open(int width, int height) {
     v->over_flags_plane = (uint8_t*)calloc(plane, 1);   // AP I: condover SELECT flag
     v->qscale_table     = (int16_t*)calloc(plane, sizeof(int16_t));  // AP: per-MB mquant
 
-    // Output planes (MB-aligned), like the msmpeg4 port.
+    v->direct_mb_plane  = (uint8_t*)calloc(plane, 1);   // B: per-MB direct-mode flag
+
+    // Pictures (MB-aligned), like the msmpeg4 port: three I/P pictures (last_pic,
+    // next_pic and the one being decoded) plus the B/BI output picture.
     v->codedW  = v->mb_width * 16;  v->codedH = v->mb_height * 16;
     v->yStride = v->codedW;         v->cStride = v->codedW >> 1;
-    v->planeY = (uint8_t*)calloc((size_t)v->yStride * v->codedH, 1);
-    v->planeU = (uint8_t*)calloc((size_t)v->cStride * (v->codedH >> 1), 1);
-    v->planeV = (uint8_t*)calloc((size_t)v->cStride * (v->codedH >> 1), 1);
+    size_t ysz = (size_t)v->yStride * v->codedH, csz = (size_t)v->cStride * (v->codedH >> 1);
+    for (int k = 0; k < 3; k++) {
+        v->picY[k] = (uint8_t*)calloc(ysz, 1);
+        v->picU[k] = (uint8_t*)calloc(csz, 1);
+        v->picV[k] = (uint8_t*)calloc(csz, 1);
+    }
+    v->bpY = (uint8_t*)calloc(ysz, 1);
+    v->bpU = (uint8_t*)calloc(csz, 1);
+    v->bpV = (uint8_t*)calloc(csz, 1);
+    v->idx_last = 0; v->idx_next = 1; v->nrefs = 0;
+    v->planeY = v->picY[0]; v->planeU = v->picU[0]; v->planeV = v->picV[0];
+
+    // Rolling block buffer for the delayed overlap + put (n_allocated_blks).
+    v->n_blks = v->mb_width + 2;
+    v->blk = (int16_t (*)[6][64])calloc((size_t)v->n_blks, sizeof(int16_t) * 6 * 64);
+    vc1_init_lut(32, 0, v->last_luty, v->last_lutuv, 0);
 
     // Prediction grids (mpegvideo geometry, mirrors the msmpeg4 port).
     int y_size  = v->b8_stride * (2 * v->mb_height + 1);
@@ -61,24 +77,27 @@ KEEP int vc1_open(int width, int height) {
 
     // P-frame inter state: motion_val grid, per-b8 mbtype, reference planes, per-MB deblock arrays.
     v->mv_base     = (int16_t*)calloc((size_t)total * 2, sizeof(int16_t));
+    v->mv1_base    = (int16_t*)calloc((size_t)total * 2, sizeof(int16_t));
+    v->nmv_base    = (int16_t*)calloc((size_t)total * 2, sizeof(int16_t));
     v->mbtype_base = (uint8_t*)calloc((size_t)total, 1);
-    v->refY = (uint8_t*)calloc((size_t)v->yStride * v->codedH, 1);
-    v->refU = (uint8_t*)calloc((size_t)v->cStride * (v->codedH >> 1), 1);
-    v->refV = (uint8_t*)calloc((size_t)v->cStride * (v->codedH >> 1), 1);
     int nmb = v->mb_width * v->mb_height;
     v->fr_cbp     = (uint32_t*)calloc((size_t)nmb, sizeof(uint32_t));
     v->fr_ttblk   = (int*)     calloc((size_t)nmb, sizeof(int));
     v->fr_isintra = (uint8_t*) calloc((size_t)nmb, 1);
     v->fr_lumamv  = (int16_t(*)[2])calloc((size_t)nmb, sizeof(int16_t) * 2);
+    int pics_ok = v->bpY && v->bpU && v->bpV;
+    for (int k = 0; k < 3; k++) pics_ok = pics_ok && v->picY[k] && v->picU[k] && v->picV[k];
     if (!v->mv_type_mb_plane || !v->mbskip_table || !v->acpred_plane || !v->over_flags_plane ||
-        !v->qscale_table ||
-        !v->planeY || !v->planeU || !v->planeV ||
-        !v->dc_base || !v->ac_base || !v->coded_base || !v->mv_base || !v->mbtype_base ||
-        !v->refY || !v->refU || !v->refV || !v->fr_cbp || !v->fr_ttblk || !v->fr_isintra || !v->fr_lumamv) {
+        !v->qscale_table || !v->direct_mb_plane || !pics_ok || !v->blk ||
+        !v->dc_base || !v->ac_base || !v->coded_base || !v->mv_base || !v->mv1_base || !v->nmv_base ||
+        !v->mbtype_base || !v->fr_cbp || !v->fr_ttblk || !v->fr_isintra || !v->fr_lumamv) {
         vc1_close((int)(intptr_t)v);
         return 0;
     }
     v->mv_val  = v->mv_base     + (size_t)(lead + v->dc_off) * 2;
+    v->mv1_val = v->mv1_base    + (size_t)(lead + v->dc_off) * 2;
+    v->nmv_val = v->nmv_base    + (size_t)(lead + v->dc_off) * 2;
+    v->mvb     = v->nmv_val;
     v->mbtype  = v->mbtype_base +  lead + v->dc_off;
     v->dc_val      = v->dc_base    + lead + v->dc_off;
     v->ac_val      = v->ac_base    + (size_t)(lead + v->dc_off) * 16;
@@ -106,10 +125,12 @@ KEEP void vc1_close(int handle) {
     free(v->acpred_plane);
     free(v->over_flags_plane);
     free(v->qscale_table);
-    free(v->planeY); free(v->planeU); free(v->planeV);
+    free(v->direct_mb_plane);
+    for (int k = 0; k < 3; k++) { free(v->picY[k]); free(v->picU[k]); free(v->picV[k]); }
+    free(v->bpY); free(v->bpU); free(v->bpV);
+    free(v->blk);
     free(v->dc_base); free(v->ac_base); free(v->coded_base);
-    free(v->mv_base); free(v->mbtype_base);
-    free(v->refY); free(v->refU); free(v->refV);
+    free(v->mv_base); free(v->mv1_base); free(v->nmv_base); free(v->mbtype_base);
     free(v->fr_cbp); free(v->fr_ttblk); free(v->fr_isintra); free(v->fr_lumamv);
     free(v);
 }
@@ -166,33 +187,63 @@ KEEP int vc1_test_pichdr(int handle, const uint8_t* bytes, int len, int* out) {
     return r;
 }
 
-// Decode one Simple/Main I-frame payload (picture header + block decode) into the
-// handle's planes. Sequence header must already be parsed. `bytes` padded with >= 8
-// zero bytes. Returns 0 on success. Plane data read via vc1_plane_* / vc1_stride_*.
+// Decode one Simple/Main picture payload (I, P, B or BI — from its picture header).
+// Reference management follows ffmpeg's mpegvideo: an I/P picture is decoded into the
+// oldest of the three reference slots and becomes next_pic (the previous next_pic
+// becomes last_pic); a B/BI picture is decoded into its own slot from last_pic
+// (forward) and next_pic (backward) and is never a reference. The decoded picture is
+// what vc1_plane_* return — DECODE order; the reader maps display order onto it.
+// Returns VC1_OK, VC1_NO_PICTURE (output unchanged), VC1_ERR, or an unsupported-
+// feature code (VC1_ERR_RESPIC / VC1_ERR_X8; the references are then stale until
+// the next decodable I picture, and every P/B until then reports the same code).
+static int vc1_decode_picture(VC1Context* v, const uint8_t* bytes, int len) {
+    mp4::GetBits gb;
+    mp4::init_get_bits(&gb, bytes, len);
+    int r = vc1_parse_frame_header(v, &gb);
+    if (r != VC1_OK) return r;
+
+    if (v->pict_type == PICT_B) {
+        if (v->ref_broken) return v->ref_broken;
+        if (v->nrefs < 2) return VC1_NO_PICTURE;   // skip B-frames without reference frames
+        if (v->x8_type) return VC1_ERR_X8;
+        v->refY  = v->picY[v->idx_last]; v->refU  = v->picU[v->idx_last]; v->refV  = v->picV[v->idx_last];
+        v->nextY = v->picY[v->idx_next]; v->nextU = v->picU[v->idx_next]; v->nextV = v->picV[v->idx_next];
+        v->planeY = v->bpY; v->planeU = v->bpU; v->planeV = v->bpV;
+        v->mvb = v->mv1_val;
+        return v->bi_type ? vc1_decode_i_frame(v, &gb) : vc1_decode_b_frame(v, &gb);
+    }
+
+    if (v->pict_type == PICT_I) {
+        if (v->x8_type) { v->ref_broken = VC1_ERR_X8;     return VC1_ERR_X8; }
+        if (v->respic)  { v->ref_broken = VC1_ERR_RESPIC; return VC1_ERR_RESPIC; }
+    } else {
+        if (v->ref_broken) return v->ref_broken;
+        if (v->respic)  { v->ref_broken = VC1_ERR_RESPIC; return VC1_ERR_RESPIC; }
+        if (!v->nrefs) return VC1_ERR;               // P without a reference picture
+    }
+    int dst = v->idx_last;                           // oldest reference slot is free now
+    v->refY = v->picY[v->idx_next]; v->refU = v->picU[v->idx_next]; v->refV = v->picV[v->idx_next];
+    v->planeY = v->picY[dst]; v->planeU = v->picU[dst]; v->planeV = v->picV[dst];
+    v->mvb = v->nmv_val;
+    r = (v->pict_type == PICT_I) ? vc1_decode_i_frame(v, &gb) : vc1_decode_p_frame(v, &gb);
+    v->idx_last = v->idx_next;
+    v->idx_next = dst;
+    if (v->nrefs < 2) v->nrefs++;
+    if (v->pict_type == PICT_I && r == VC1_OK) v->ref_broken = 0;
+    return r;
+}
+
+// Test hooks kept for the I+P conformance tests: both decode whatever picture the
+// payload carries (vc1_decode_picture). `bytes` padded with >= 8 zero bytes.
 KEEP int vc1_decode_iframe(int handle, const uint8_t* bytes, int len) {
     VC1Context* v = (VC1Context*)(intptr_t)handle;
     if (!v) return VC1_ERR;
-    mp4::GetBits gb;
-    mp4::init_get_bits(&gb, bytes, len);
-    if (vc1_parse_frame_header(v, &gb) != VC1_OK) return VC1_ERR;
-    if (v->pict_type != PICT_I) return VC1_ERR;
-    return vc1_decode_i_frame(v, &gb);
+    return vc1_decode_picture(v, bytes, len);
 }
-
-// Decode one Simple/Main P-frame payload into the handle's planes. The previous
-// decoded frame (in planeY/U/V) is copied to refY/U/V first (MC source). Sequence
-// header must already be parsed and an I-frame decoded. `bytes` padded >= 8 zeros.
 KEEP int vc1_decode_pframe(int handle, const uint8_t* bytes, int len) {
     VC1Context* v = (VC1Context*)(intptr_t)handle;
     if (!v) return VC1_ERR;
-    memcpy(v->refY, v->planeY, (size_t)v->yStride * v->codedH);
-    memcpy(v->refU, v->planeU, (size_t)v->cStride * (v->codedH >> 1));
-    memcpy(v->refV, v->planeV, (size_t)v->cStride * (v->codedH >> 1));
-    mp4::GetBits gb;
-    mp4::init_get_bits(&gb, bytes, len);
-    if (vc1_parse_frame_header(v, &gb) != VC1_OK) return VC1_ERR;
-    if (v->pict_type != PICT_P) return VC1_ERR;
-    return vc1_decode_p_frame(v, &gb);
+    return vc1_decode_picture(v, bytes, len);
 }
 
 // Parse the STRUCT_C sequence header (from ASF extradata) into the handle. 0 on ok.
@@ -204,23 +255,29 @@ KEEP int vc1_seqhdr(int handle, const uint8_t* bytes, int len) {
     return vc1_decode_sequence_header(v, &gb) == VC1_OK ? 0 : VC1_ERR;
 }
 
-// Decode one frame (I or P, auto-detected from the picture header) into the handle's
-// planes. For P frames the previous output is copied to the reference first. This is
-// the single entry ASFReader's decoder factory drives. `bytes` padded >= 8 zeros.
+// Decode one frame payload — the single entry the VC1Decoder.js factory drives.
+// `bytes` padded >= 8 zeros. Return codes as vc1_decode_picture.
 KEEP int vc1_decode_frame(int handle, const uint8_t* bytes, int len) {
     VC1Context* v = (VC1Context*)(intptr_t)handle;
     if (!v) return VC1_ERR;
-    mp4::GetBits gb;
-    mp4::init_get_bits(&gb, bytes, len);
-    if (vc1_parse_frame_header(v, &gb) != VC1_OK) return VC1_ERR;
-    if (v->pict_type == PICT_I) return vc1_decode_i_frame(v, &gb);
-    if (v->pict_type == PICT_P) {
-        memcpy(v->refY, v->planeY, (size_t)v->yStride * v->codedH);
-        memcpy(v->refU, v->planeU, (size_t)v->cStride * (v->codedH >> 1));
-        memcpy(v->refV, v->planeV, (size_t)v->cStride * (v->codedH >> 1));
-        return vc1_decode_p_frame(v, &gb);
-    }
-    return VC1_ERR;
+    return vc1_decode_picture(v, bytes, len);
+}
+
+// Picture type of the last parsed picture header: 1 = I, 2 = P, 3 = B (BI included).
+KEEP int vc1_pict_type(int handle) { return ((VC1Context*)(intptr_t)handle)->pict_type; }
+
+// MAXBFRAMES from the sequence header (0 = no B pictures, output is never delayed).
+KEEP int vc1_max_b_frames(int handle) { return ((VC1Context*)(intptr_t)handle)->max_b_frames; }
+
+// Point vc1_plane_* at a held picture: 0 = the picture just decoded, 1 = last_pic (the
+// older reference), 2 = next_pic (the newest reference). VC1Decoder.js uses it to give
+// ffmpeg's display order: a B/BI picture shows at once, an I/P shows the previous I/P,
+// and the end of the stream shows the newest reference.
+KEEP void vc1_select_output(int handle, int which) {
+    VC1Context* v = (VC1Context*)(intptr_t)handle;
+    if (!v || which == 0) return;
+    int k = which == 1 ? v->idx_last : v->idx_next;
+    v->planeY = v->picY[k]; v->planeU = v->picU[k]; v->planeV = v->picV[k];
 }
 
 // Advanced Profile (WVC1) header conformance hook. Feeds a raw .vc1 elementary
