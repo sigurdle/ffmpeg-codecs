@@ -36,7 +36,16 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef __wasm_simd128__
+#include <wasm_simd128.h>
+#include "../common/wasm_simd_idct.h"	// wsi_load16x4 / wsi_transpose4_i32 / wsi_store_trunc16
+#endif
+
 #define PADDING 64	// AV_INPUT_BUFFER_PADDING_SIZE: zeroed bytes behind the packet
+
+// SIMD kernels on by default; prores_set_simd(0|1) switches to the scalar ones for the
+// A/B conformance check. Both are byte-identical.
+static int g_simd = 1;
 
 // ---------------------------------------------------------------- tables (proresdata.c)
 
@@ -304,6 +313,132 @@ static void prores_idct_put_12(uint16_t *out, int linesize, int16_t *block, cons
 		for (int x = 0; x < 8; x++)
 			out[x] = clip(block[(y << 3) + x], CLIP_MIN, CLIP_MAX_12);
 }
+
+#ifdef __wasm_simd128__
+// ---------------------------------------------------------------- IDCT, WebAssembly i32x4
+//
+// Byte-identical to prores_idct_put_10/12 above, on the skeleton of the mpeg4 simple IDCT
+// (plugins/mpeg4/simple_idct8.h): a row pass on 4 rows a vector, a 4x4 transpose, a column
+// pass on 4 columns a vector, all i32x4 wrapping mod 2^32 like the scalar unsigned
+// accumulators (-fwrapv). The scalar int16 steps are kept: the dequant multiply wraps in
+// i16x8, the row results and the +8192 are truncated to int16, and so are the column
+// results before the clip. Skipping a zero coefficient (the scalar `if (col[8*k])`) adds
+// nothing, so the vectors always take every term. The row DC shortcut, (row[0] + 1) >> 1,
+// equals the butterfly for 10 bits (W4 = 2^14) but not for 12 (W4 = 32767): DC-only rows
+// are blended in per lane, as the scalar path takes it.
+template <int W1, int W2, int W3, int W4, int W5, int W6, int W7, int ROW_SHIFT, int COL_SHIFT, int EXTRA_SHIFT, int CLIP_MAX>
+struct SimdIdct {
+	static inline v128_t imc(v128_t x, int c) { return wasm_i32x4_mul(x, wasm_i32x4_splat(c)); }
+	static inline v128_t i16trunc(v128_t x) { return wasm_i32x4_shr(wasm_i32x4_shl(x, 16), 16); }
+
+	// e[k]: coefficient k of 4 rows (one row a lane). o[k]: the int16-truncated outputs.
+	static inline void row(const v128_t e[8], v128_t o[8])
+	{
+		const int S = ROW_SHIFT + EXTRA_SHIFT;
+		v128_t a0 = wasm_i32x4_add(imc(e[0], W4), wasm_i32x4_splat(1 << (S - 1)));
+		v128_t a1 = a0, a2 = a0, a3 = a0;
+		a0 = wasm_i32x4_add(a0, imc(e[2], W2)); a1 = wasm_i32x4_add(a1, imc(e[2], W6));
+		a2 = wasm_i32x4_sub(a2, imc(e[2], W6)); a3 = wasm_i32x4_sub(a3, imc(e[2], W2));
+		a0 = wasm_i32x4_add(a0, wasm_i32x4_add(imc(e[4], W4), imc(e[6], W6)));
+		a1 = wasm_i32x4_sub(a1, wasm_i32x4_add(imc(e[4], W4), imc(e[6], W2)));
+		a2 = wasm_i32x4_add(wasm_i32x4_sub(a2, imc(e[4], W4)), imc(e[6], W2));
+		a3 = wasm_i32x4_sub(wasm_i32x4_add(a3, imc(e[4], W4)), imc(e[6], W6));
+		v128_t b0 = wasm_i32x4_add(imc(e[1], W1), imc(e[3], W3));
+		v128_t b1 = wasm_i32x4_sub(imc(e[1], W3), imc(e[3], W7));
+		v128_t b2 = wasm_i32x4_sub(imc(e[1], W5), imc(e[3], W1));
+		v128_t b3 = wasm_i32x4_sub(imc(e[1], W7), imc(e[3], W5));
+		b0 = wasm_i32x4_add(b0, wasm_i32x4_add(imc(e[5], W5), imc(e[7], W7)));
+		b1 = wasm_i32x4_sub(b1, wasm_i32x4_add(imc(e[5], W1), imc(e[7], W5)));
+		b2 = wasm_i32x4_add(b2, wasm_i32x4_add(imc(e[5], W7), imc(e[7], W3)));
+		b3 = wasm_i32x4_add(b3, wasm_i32x4_sub(imc(e[5], W3), imc(e[7], W1)));
+		v128_t f[8];
+		f[0] = i16trunc(wasm_i32x4_shr(wasm_i32x4_add(a0, b0), S));
+		f[7] = i16trunc(wasm_i32x4_shr(wasm_i32x4_sub(a0, b0), S));
+		f[1] = i16trunc(wasm_i32x4_shr(wasm_i32x4_add(a1, b1), S));
+		f[6] = i16trunc(wasm_i32x4_shr(wasm_i32x4_sub(a1, b1), S));
+		f[2] = i16trunc(wasm_i32x4_shr(wasm_i32x4_add(a2, b2), S));
+		f[5] = i16trunc(wasm_i32x4_shr(wasm_i32x4_sub(a2, b2), S));
+		f[3] = i16trunc(wasm_i32x4_shr(wasm_i32x4_add(a3, b3), S));
+		f[4] = i16trunc(wasm_i32x4_shr(wasm_i32x4_sub(a3, b3), S));
+		const v128_t dc = i16trunc(wasm_i32x4_shr(wasm_i32x4_add(e[0], wasm_i32x4_splat(1)), 1));
+		const v128_t ac = wasm_v128_or(wasm_v128_or(wasm_v128_or(e[1], e[2]), wasm_v128_or(e[3], e[4])),
+		                               wasm_v128_or(wasm_v128_or(e[5], e[6]), e[7]));
+		const v128_t dcOnly = wasm_i32x4_eq(ac, wasm_i32x4_splat(0));
+		for (int k = 0; k < 8; k++) o[k] = wasm_v128_bitselect(dc, f[k], dcOnly);
+	}
+
+	// c[r]: row r of 4 columns (one column a lane). out[r]: the int16-truncated outputs.
+	static inline void col(const v128_t c[8], v128_t out[8])
+	{
+		v128_t a0 = imc(wasm_i32x4_add(c[0], wasm_i32x4_splat((1 << (COL_SHIFT - 1)) / W4)), W4);
+		v128_t a1 = a0, a2 = a0, a3 = a0;
+		a0 = wasm_i32x4_add(a0, imc(c[2], W2)); a1 = wasm_i32x4_add(a1, imc(c[2], W6));
+		a2 = wasm_i32x4_sub(a2, imc(c[2], W6)); a3 = wasm_i32x4_sub(a3, imc(c[2], W2));
+		v128_t b0 = imc(c[1], W1), b1 = imc(c[1], W3), b2 = imc(c[1], W5), b3 = imc(c[1], W7);
+		b0 = wasm_i32x4_add(b0, imc(c[3], W3)); b1 = wasm_i32x4_sub(b1, imc(c[3], W7));
+		b2 = wasm_i32x4_sub(b2, imc(c[3], W1)); b3 = wasm_i32x4_sub(b3, imc(c[3], W5));
+		a0 = wasm_i32x4_add(a0, imc(c[4], W4)); a1 = wasm_i32x4_sub(a1, imc(c[4], W4));
+		a2 = wasm_i32x4_sub(a2, imc(c[4], W4)); a3 = wasm_i32x4_add(a3, imc(c[4], W4));
+		b0 = wasm_i32x4_add(b0, imc(c[5], W5)); b1 = wasm_i32x4_sub(b1, imc(c[5], W1));
+		b2 = wasm_i32x4_add(b2, imc(c[5], W7)); b3 = wasm_i32x4_add(b3, imc(c[5], W3));
+		a0 = wasm_i32x4_add(a0, imc(c[6], W6)); a1 = wasm_i32x4_sub(a1, imc(c[6], W2));
+		a2 = wasm_i32x4_add(a2, imc(c[6], W2)); a3 = wasm_i32x4_sub(a3, imc(c[6], W6));
+		b0 = wasm_i32x4_add(b0, imc(c[7], W7)); b1 = wasm_i32x4_sub(b1, imc(c[7], W5));
+		b2 = wasm_i32x4_add(b2, imc(c[7], W3)); b3 = wasm_i32x4_sub(b3, imc(c[7], W1));
+		const int S = COL_SHIFT;
+		out[0] = i16trunc(wasm_i32x4_shr(wasm_i32x4_add(a0, b0), S));
+		out[7] = i16trunc(wasm_i32x4_shr(wasm_i32x4_sub(a0, b0), S));
+		out[1] = i16trunc(wasm_i32x4_shr(wasm_i32x4_add(a1, b1), S));
+		out[6] = i16trunc(wasm_i32x4_shr(wasm_i32x4_sub(a1, b1), S));
+		out[2] = i16trunc(wasm_i32x4_shr(wasm_i32x4_add(a2, b2), S));
+		out[5] = i16trunc(wasm_i32x4_shr(wasm_i32x4_sub(a2, b2), S));
+		out[3] = i16trunc(wasm_i32x4_shr(wasm_i32x4_add(a3, b3), S));
+		out[4] = i16trunc(wasm_i32x4_shr(wasm_i32x4_sub(a3, b3), S));
+	}
+
+	static inline void put(uint16_t *out, int linesize, int16_t *block, const int16_t *qmat)
+	{
+		for (int i = 0; i < 64; i += 8)
+			wasm_v128_store(block + i, wasm_i16x8_mul(wasm_v128_load(block + i), wasm_v128_load(qmat + i)));
+
+		int16_t tmp[64];
+		for (int rb = 0; rb < 8; rb += 4) {
+			v128_t e[8];
+			wsi_transpose4_i32(wsi_load16x4(block + (rb + 0) * 8), wsi_load16x4(block + (rb + 1) * 8),
+			                   wsi_load16x4(block + (rb + 2) * 8), wsi_load16x4(block + (rb + 3) * 8),
+			                   &e[0], &e[1], &e[2], &e[3]);
+			wsi_transpose4_i32(wsi_load16x4(block + (rb + 0) * 8 + 4), wsi_load16x4(block + (rb + 1) * 8 + 4),
+			                   wsi_load16x4(block + (rb + 2) * 8 + 4), wsi_load16x4(block + (rb + 3) * 8 + 4),
+			                   &e[4], &e[5], &e[6], &e[7]);
+			v128_t o[8];
+			row(e, o);
+			v128_t r[8];
+			wsi_transpose4_i32(o[0], o[1], o[2], o[3], &r[0], &r[1], &r[2], &r[3]);	// rows rb..rb+3, columns 0-3
+			wsi_transpose4_i32(o[4], o[5], o[6], o[7], &r[4], &r[5], &r[6], &r[7]);	// rows rb..rb+3, columns 4-7
+			for (int k = 0; k < 4; k++) {
+				wsi_store_trunc16(tmp + (rb + k) * 8, r[k]);
+				wsi_store_trunc16(tmp + (rb + k) * 8 + 4, r[k + 4]);
+			}
+		}
+
+		const v128_t lo = wasm_i32x4_splat(CLIP_MIN), hi = wasm_i32x4_splat(CLIP_MAX);
+		for (int cb = 0; cb < 8; cb += 4) {
+			v128_t c[8];
+			c[0] = i16trunc(wasm_i32x4_add(wsi_load16x4(tmp + cb), wasm_i32x4_splat(8192)));
+			for (int r = 1; r < 8; r++) c[r] = wsi_load16x4(tmp + r * 8 + cb);
+			v128_t o[8];
+			col(c, o);
+			for (int r = 0; r < 8; r++) {
+				const v128_t v = wasm_i32x4_min(wasm_i32x4_max(o[r], lo), hi);
+				wasm_v128_store64_lane(out + r * linesize + cb, wasm_u16x8_narrow_i32x4(v, v), 0);
+			}
+		}
+	}
+};
+
+typedef SimdIdct<22725, 21407, 19265, 16384, 12873, 8867, 4520, 13, 18, 2, CLIP_MAX_10> SimdIdct10;
+typedef SimdIdct<45451, 42813, 38531, 32767, 25746, 17734, 9041, 16, 17, 0, CLIP_MAX_12> SimdIdct12;
+#endif
 
 // ---------------------------------------------------------------- context
 
@@ -704,6 +839,13 @@ static inline int decode_ac_coeffs(const ProresCtx *ctx, GetBits *gb, int16_t *o
 
 static inline void idct_put(const ProresCtx *ctx, uint16_t *out, int linesize, int16_t *block, const int16_t *qmat)
 {
+#ifdef __wasm_simd128__
+	if (g_simd) {
+		if (ctx->bits == 10) SimdIdct10::put(out, linesize, block, qmat);
+		else                 SimdIdct12::put(out, linesize, block, qmat);
+		return;
+	}
+#endif
 	if (ctx->bits == 10) prores_idct_put_10(out, linesize, block, qmat);
 	else                 prores_idct_put_12(out, linesize, block, qmat);
 }
@@ -1005,6 +1147,8 @@ void prores_info(const ProresCtx *ctx, int32_t *out)
 	out[8] = ctx->bits;
 }
 
+void prores_set_simd(int on) { g_simd = on ? 1 : 0; }
+
 uint16_t *prores_plane(const ProresCtx *ctx, int i) { return (i >= 0 && i < 4) ? ctx->plane[i] : nullptr; }
 int prores_stride(const ProresCtx *ctx, int i) { return (i >= 0 && i < 4) ? ctx->stride[i] : 0; }
 
@@ -1033,13 +1177,66 @@ uint16_t *prores_to_rgba16(ProresCtx *ctx, float kr, float kb)
 	const float alphaScale = 65535.0f / (float)((1 << ctx->bits) - 1);
 	const int lastC = ctx->chroma444 ? w - 1 : (w - 1) >> 1;
 
+#ifdef __wasm_simd128__
+	const v128_t vYOff = wasm_f32x4_splat(yOff), vYScale = wasm_f32x4_splat(yScale);
+	const v128_t vCOff = wasm_f32x4_splat(cOff), vCScale = wasm_f32x4_splat(cScale);
+	const v128_t vCrToR = wasm_f32x4_splat(crToR), vCbToB = wasm_f32x4_splat(cbToB);
+	const v128_t vCrToG = wasm_f32x4_splat(crToG), vCbToG = wasm_f32x4_splat(cbToG);
+	const v128_t vZero = wasm_f32x4_splat(0.0f), vOne = wasm_f32x4_splat(1.0f);
+	const v128_t vFull = wasm_f32x4_splat(65535.0f), vHalf = wasm_f32x4_splat(0.5f);
+	const v128_t vAlphaScale = wasm_f32x4_splat(alphaScale);
+	const v128_t vOpaque = wasm_i32x4_splat(65535);
+	// 0..65535.5 -> uint16, as the scalar (uint16_t)(v + 0.5f) truncates.
+	auto quantize = [&](v128_t v) { return wasm_i32x4_trunc_sat_f32x4(wasm_f32x4_add(wasm_f32x4_mul(v, vFull), vHalf)); };
+	auto unit01 = [&](v128_t v) { return wasm_f32x4_pmin(wasm_f32x4_pmax(v, vZero), vOne); };
+#endif
+
 	for (int y = 0; y < h; y++) {
 		const uint16_t *Y = ctx->plane[0] + y * ctx->stride[0];
 		const uint16_t *U = ctx->plane[1] + y * ctx->stride[1];
 		const uint16_t *V = ctx->plane[2] + y * ctx->stride[2];
 		const uint16_t *A = ctx->plane[3] + y * ctx->stride[3];
 		uint16_t *out = ctx->rgba + (size_t)y * w * 4;
-		for (int x = 0; x < w; x++) {
+		int x = 0;
+
+#ifdef __wasm_simd128__
+		// Four pixels a step, the scalar loop's operations in its order (no fused multiply-add
+		// in wasm SIMD), so both give the same values. 4:2:2 steps need chroma c .. c + 3 within
+		// the row's last chroma column, as the scalar clamps at the edge; the tail runs scalar.
+		if (g_simd) {
+			for (; x + 4 <= w && (ctx->chroma444 || (x >> 1) + 3 <= lastC); x += 4) {
+				v128_t cb, cr;
+				if (ctx->chroma444) {
+					cb = wasm_f32x4_convert_i32x4(wasm_u32x4_load16x4(U + x));
+					cr = wasm_f32x4_convert_i32x4(wasm_u32x4_load16x4(V + x));
+				} else {
+					// [c0, c1, c2, c3] -> [2c0, c0 + c1, 2c1, c1 + c2] * 0.5: even pixels take
+					// their sample, odd ones the mean with the next.
+					const v128_t u = wasm_u32x4_load16x4(U + (x >> 1)), v = wasm_u32x4_load16x4(V + (x >> 1));
+					const v128_t us = wasm_i32x4_add(wasm_i32x4_shuffle(u, u, 0, 0, 1, 1), wasm_i32x4_shuffle(u, u, 0, 1, 1, 2));
+					const v128_t vs = wasm_i32x4_add(wasm_i32x4_shuffle(v, v, 0, 0, 1, 1), wasm_i32x4_shuffle(v, v, 0, 1, 1, 2));
+					cb = wasm_f32x4_mul(vHalf, wasm_f32x4_convert_i32x4(us));
+					cr = wasm_f32x4_mul(vHalf, wasm_f32x4_convert_i32x4(vs));
+				}
+				const v128_t l = wasm_f32x4_mul(wasm_f32x4_sub(wasm_f32x4_convert_i32x4(wasm_u32x4_load16x4(Y + x)), vYOff), vYScale);
+				cb = wasm_f32x4_mul(wasm_f32x4_sub(cb, vCOff), vCScale);
+				cr = wasm_f32x4_mul(wasm_f32x4_sub(cr, vCOff), vCScale);
+				const v128_t r = unit01(wasm_f32x4_add(l, wasm_f32x4_mul(vCrToR, cr)));
+				const v128_t g = unit01(wasm_f32x4_add(wasm_f32x4_add(l, wasm_f32x4_mul(vCrToG, cr)), wasm_f32x4_mul(vCbToG, cb)));
+				const v128_t b = unit01(wasm_f32x4_add(l, wasm_f32x4_mul(vCbToB, cb)));
+				const v128_t a = ctx->alpha_info
+					? wasm_i32x4_trunc_sat_f32x4(wasm_f32x4_add(wasm_f32x4_mul(wasm_f32x4_convert_i32x4(wasm_u32x4_load16x4(A + x)), vAlphaScale), vHalf))
+					: vOpaque;
+				const v128_t rg = wasm_u16x8_narrow_i32x4(quantize(r), quantize(g));	// r0..r3 g0..g3
+				const v128_t ba = wasm_u16x8_narrow_i32x4(quantize(b), a);		// b0..b3 a0..a3
+				wasm_v128_store(out,     wasm_i16x8_shuffle(rg, ba, 0, 4, 8, 12, 1, 5, 9, 13));
+				wasm_v128_store(out + 8, wasm_i16x8_shuffle(rg, ba, 2, 6, 10, 14, 3, 7, 11, 15));
+				out += 16;
+			}
+		}
+#endif
+
+		for (; x < w; x++) {
 			float cb, cr;
 			if (ctx->chroma444) {
 				cb = U[x];

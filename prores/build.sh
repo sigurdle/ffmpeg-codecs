@@ -8,7 +8,8 @@
 # owning one frame's planes, as in the SVQ3 port.
 #
 # -fwrapv: the IDCT and the dequant rely on two's-complement wrap to be byte-identical to
-# FFmpeg.
+# FFmpeg. -msimd128: the IDCT and the RGBA16 conversion have i32x4 / f32x4 kernels
+# (prores_set_simd(0) selects the scalar ones), byte-identical to the scalar code.
 #
 # Outputs:
 #   ./prores_decode.{mjs,wasm}                 shipped decoder (web,worker)
@@ -38,7 +39,7 @@ OBJ="$HERE_W/prores_decode.o"
 echo "compiling prores ($OPT)..."
 emcc $OPT -msimd128 -fwrapv -ffunction-sections -fdata-sections -fno-exceptions -fno-rtti -c "$SRC" -o "$OBJ"
 
-EXPORTS=_prores_open,_prores_close,_prores_input,_prores_parse_header,_prores_decode_frame,_prores_info,_prores_plane,_prores_stride,_prores_to_rgba16,_malloc,_free
+EXPORTS=_prores_open,_prores_close,_prores_input,_prores_parse_header,_prores_decode_frame,_prores_info,_prores_plane,_prores_stride,_prores_to_rgba16,_prores_set_simd,_malloc,_free
 
 LINK_COMMON=( $LINK_OPT -Wl,--gc-sections -sMALLOC=emmalloc -sFILESYSTEM=0
               -sALLOW_MEMORY_GROWTH=1
