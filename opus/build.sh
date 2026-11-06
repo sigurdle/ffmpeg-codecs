@@ -38,7 +38,7 @@ OBJ="$HERE_W/opus_decode.o"
 echo "compiling opus ($OPT)..."
 emcc $OPT -fwrapv -ffunction-sections -fdata-sections -fno-exceptions -fno-rtti -c "$SRC" -o "$OBJ"
 
-EXPORTS=_opus_open,_opus_close,_opus_reset,_opus_decode_packet,_opus_flush,_opus_channel_ptr,_malloc,_free
+EXPORTS=_opus_open,_opus_map_channel,_opus_close,_opus_reset,_opus_packet_samples,_opus_decode_packet,_opus_flush,_opus_channel_ptr,_malloc,_free
 
 LINK_COMMON=( $LINK_OPT -Wl,--gc-sections -sMALLOC=emmalloc -sFILESYSTEM=0
               -sALLOW_MEMORY_GROWTH=1

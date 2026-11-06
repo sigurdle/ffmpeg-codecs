@@ -12,6 +12,10 @@
 	    state instead, so a lone second or third LBRR frame loses the range coder: the rest of the frame is noise and a redundancy
 	    frame that is not there gets read. The other LBRR effects of FFmpeg stay (frame->nlsf, lpc and log_gain take the LBRR
 	    frame's), so a stream with LBRR differs slightly from libopus, as it does in FFmpeg.
+	  - Mono output of a stereo packet of 40 or 60 ms: the side channel is still read, so frame->coded and prev_voiced follow it, as
+	    silk_Decode of libopus decodes the side channel whatever the output and codes its later frames conditionally. FFmpeg
+	    returns before it sets them, so the side channel's second frame reads an absolute gain and pitch lag that are not there and
+	    the range coder is lost.
 */
 
 #pragma once
@@ -659,12 +663,17 @@ static void silk_decode_frame(SilkContext *s, OpusRangeCoder *rc,
     silk_decode_excitation(s, rc, residual + SILK_MAX_LAG, qoffset_high,
                            active, voiced);
 
-    /* skip synthesising the output if we do not need it */
-    if (redundant)
+    /* skip synthesizing the output if we do not need it */
+    if (redundant) {
         s->lbrr_prev_voiced[channel] = voiced;
-    // TODO: implement error recovery
-    if (s->output_channels == channel || redundant)
         return;
+    }
+    // TODO: implement error recovery
+    if (s->output_channels == channel) {
+        frame->prev_voiced = voiced;
+        frame->coded = 1;
+        return;
+    }
 
     /* generate the output signal */
     for (i = 0; i < s->subframes; i++) {
