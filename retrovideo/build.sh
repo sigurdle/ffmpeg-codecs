@@ -52,7 +52,7 @@ COMMON_W="$(cd "$HERE_W/../common" && pwd -W)"
 echo "compiling retrovideo ($OPT)..."
 emcc $OPT -msimd128 -fwrapv -I"$COMMON_W" -ffunction-sections -fdata-sections -fno-exceptions -fno-rtti -c "$SRC" -o "$OBJ"
 
-EXPORTS=_rv_open,_rv_close,_rv_reset,_rv_decode_frame,_rv_plane_ptr,_rv_set_simd,_rv_test_transform,_rv_bench_transform,_malloc,_free
+EXPORTS=_rv_open,_rv_close,_rv_reset,_rv_decode_frame,_rv_set_extradata,_rv_plane_ptr,_rv_set_simd,_rv_test_transform,_rv_bench_transform,_malloc,_free
 
 LINK_COMMON=( $LINK_OPT -Wl,--gc-sections -sMALLOC=emmalloc -sFILESYSTEM=0
               -sALLOW_MEMORY_GROWTH=1
