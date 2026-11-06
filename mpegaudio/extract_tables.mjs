@@ -84,14 +84,14 @@ function initializer(text, sym) {
    * Reject anything that is not a pure data initializer.
    *
    * The `=` test above also matches an ASSIGNMENT to an element, e.g. FFmpeg fills
-   * ff_scale_factor_modshift[i] in a loop rather than initializing it — that match
+   * ff_scale_factor_modshift[i] in a loop rather than initializing it -- that match
    * would happily brace-capture the surrounding function body and emit it as a
    * "table". Real initializers contain only numbers, separators and comments, so
    * anything with a statement in it is a mis-extraction, not a table.
    */
   const stripped = body.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
   if (/[;()]/.test(stripped) || /\b(?:for|if|int|return|uint\w*)\b/.test(stripped))
-    throw new Error(`${sym}: matched a statement, not a data initializer — is it runtime-filled upstream?`);
+    throw new Error(`${sym}: matched a statement, not a data initializer \u2014 is it runtime-filled upstream?`);
 
   return body;
 }
@@ -99,7 +99,7 @@ function initializer(text, sym) {
 let out = `/*
 	MPEG audio (MPEG-1/2/2.5 Layer I/II/III) constant tables.
 
-	GENERATED — do not edit by hand. Extracted verbatim from FFmpeg's libavcodec
+	GENERATED \u2014 do not edit by hand. Extracted verbatim from FFmpeg's libavcodec
 	(release/8.1, LGPL) by extract_tables.mjs, which lists the symbol and source file
 	for each one. Re-run it when re-basing on a newer FFmpeg:
 
@@ -135,7 +135,7 @@ fs.writeFileSync(path.join(import.meta.dirname, 'mpegaudio_tables.h'), out);
 console.log(`wrote mpegaudio_tables.h (${out.length} bytes, ${WANT.length} tables)`);
 
 /*
- * dct32_float.h — the 32-point DCT of the polyphase synthesis filterbank.
+ * dct32_float.h -- the 32-point DCT of the polyphase synthesis filterbank.
  *
  * Taken verbatim rather than rewritten: FFmpeg's dct32 is a fully unrolled
  * butterfly network driven by macros (BF/BF0/BF1/BF2/ADD over 32 named locals),
@@ -151,7 +151,7 @@ console.log(`wrote mpegaudio_tables.h (${out.length} bytes, ${WANT.length} table
   const dct32 = `/*
 	32-point DCT for the MPEG audio polyphase synthesis filterbank.
 
-	GENERATED — do not edit by hand. The body below is FFmpeg's dct32_template.c
+	GENERATED \u2014 do not edit by hand. The body below is FFmpeg's dct32_template.c
 	(libavcodec, release/8.1, LGPL) copied verbatim by extract_tables.mjs, with the
 	float-build macro prelude it expects supplied here instead of by FFmpeg's build
 	system. It is an unrolled butterfly network; transcribing it by hand would risk a
