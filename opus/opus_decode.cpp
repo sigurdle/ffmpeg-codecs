@@ -2,25 +2,26 @@
 	Opus audio decoder -- WASM C++.
 
 	A port of FFmpeg n8.1's Opus decoder (LGPL-2.1+): libavcodec/opus/dec.c over rc.c (opus_rc.h), parse.c (opus_parse.h), silk.c
-	(opus_silk.h), tab.c (opus_tables.h) and libswresample (opus_resample.h). One handle is one Opus stream, 1 or 2 channels, with
-	planar float output at 48 kHz.
+	(opus_silk.h), the CELT layer (opus_celt.h, opus_mdct.h), tab.c (opus_tables.h) and libswresample (opus_resample.h). One handle
+	is one Opus stream, 1 or 2 channels, with planar float output at 48 kHz.
 
 	A packet is one whole Opus packet: opus_decode_packet gives the samples its frames complete, as dec.c's opus_decode_packet does.
 	It drops nothing: the pre-skip is the container's. A call with no packet, opus_flush, gives the samples the resampler still
 	holds, as the NULL packet does at the end of a stream.
 
-	So far: SILK-only packets. Copyright as in the headers named above; dec.c is
+	So far: SILK-only and CELT-only packets. Copyright as in the headers named above; dec.c is
 	Copyright (c) 2012 Andrew D'Addesio, Copyright (c) 2013-2014 Mozilla Corporation.
 
 	Departures from FFmpeg:
-	  - A hybrid or CELT packet, and a SILK frame with a redundancy frame in its tail, refuse with OPUS_ERROR_UNSUPPORTED before
-	    or at that frame.
+	  - A hybrid packet, and a SILK frame with a redundancy frame in its tail, refuse with OPUS_ERROR_UNSUPPORTED before or at
+	    that frame.
 	  - The libavcodec framework (AVCodecContext, AVFrame, AVAudioFifo, the options) is gone. A frame that fails gives silence, as
 	    without AV_EF_EXPLODE.
 
 	-fwrapv is REQUIRED, as in FFmpeg's build.
 */
 
+#include <cfloat>
 #include <climits>
 #include <cmath>
 #include <cstdint>
@@ -54,11 +55,14 @@ static inline int av_sat_sub32(int a, int b)
 #include "opus_tables.h"
 #include "opus_parse.h"
 #include "opus_rc.h"
-#include "opus_silk.h"
-#include "opus_resample.h"
-
 #define ERROR_INVALID (-1)
 #define OPUS_ERROR_UNSUPPORTED (-2)
+
+#include "opus_silk.h"
+#include "opus_resample.h"
+#include "opus_mdct.h"
+#include "opus_celt.h"
+
 // Bytes this file zeroes past a packet's end: a bit read loads 4 past where it stops, itself 1 past the end.
 #define INPUT_PADDING 16
 // 120 ms and what a flush at a bandwidth change adds in front of it.
@@ -84,6 +88,7 @@ struct OpusStreamContext {
 
 	OpusRangeCoder rc;
 	SilkContext silk;
+	CeltFrame celt;
 
 	float silk_buf[2][960];
 	float* silk_output[2];
@@ -138,24 +143,46 @@ static int opus_decode_frame(OpusStreamContext* s, const uint8_t* data, int size
 	ff_opus_rc_dec_init(&s->rc, data, size);
 
 	/* decode the silk frame */
-	if (!swr_is_initialized(&s->swr)) {
-		opus_init_resample(s);
-	}
+	if (s->packet.mode == OPUS_MODE_SILK) {
+		if (!swr_is_initialized(&s->swr)) {
+			opus_init_resample(s);
+		}
 
-	samples = ff_silk_decode_superframe(&s->silk, &s->rc, s->silk_output,
-	                                    (OpusBandwidth)FFMIN((int)s->packet.bandwidth, (int)OPUS_BANDWIDTH_WIDEBAND),
-	                                    s->packet.stereo + 1,
-	                                    silk_frame_duration_ms[s->packet.config]);
-	if (samples < 0) {
-		return samples;
+		samples = ff_silk_decode_superframe(&s->silk, &s->rc, s->silk_output,
+		                                    (OpusBandwidth)FFMIN((int)s->packet.bandwidth, (int)OPUS_BANDWIDTH_WIDEBAND),
+		                                    s->packet.stereo + 1,
+		                                    silk_frame_duration_ms[s->packet.config]);
+		if (samples < 0) {
+			return samples;
+		}
+		samples = swr_convert(&s->swr, s->cur_out, s->packet.frame_duration, s->silk_output, samples);
+		s->delayed_samples += s->packet.frame_duration - samples;
+	} else {
+		ff_silk_flush(&s->silk);
 	}
-	samples = swr_convert(&s->swr, s->cur_out, s->packet.frame_duration, s->silk_output, samples);
-	s->delayed_samples += s->packet.frame_duration - samples;
 
 	// decode redundancy information
 	consumed = opus_rc_tell(&s->rc);
-	if (consumed + 17 <= size * 8) {
+	if (s->packet.mode == OPUS_MODE_SILK && consumed + 17 <= size * 8) {
 		return OPUS_ERROR_UNSUPPORTED;
+	}
+
+	/* decode the CELT frame */
+	if (s->packet.mode == OPUS_MODE_CELT) {
+		float* out_tmp[2] = { s->cur_out[0], s->cur_out[1] };
+
+		ff_opus_rc_dec_raw_init(&s->rc, data + size, size);
+
+		const int ret = ff_celt_decode_frame(&s->celt, &s->rc, out_tmp,
+		                                     s->packet.stereo + 1,
+		                                     s->packet.frame_duration,
+		                                     0,
+		                                     ff_celt_band_end[s->packet.bandwidth]);
+		if (ret < 0) {
+			return ret;
+		}
+	} else {
+		ff_celt_flush(&s->celt);
 	}
 
 	return samples;
@@ -239,6 +266,7 @@ EMSCRIPTEN_KEEPALIVE OpusHandle* opus_open(int channels)
 		s->out[j] = handle->output[j];
 	}
 	ff_silk_init(&s->silk, channels);
+	ff_celt_init(&s->celt, channels, 1);
 	return handle;
 }
 
@@ -255,6 +283,7 @@ EMSCRIPTEN_KEEPALIVE void opus_reset(OpusHandle* handle)
 	s->delayed_samples = 0;
 	swr_close(&s->swr);
 	ff_silk_flush(&s->silk);
+	ff_celt_flush(&s->celt);
 }
 
 /**
@@ -269,7 +298,7 @@ EMSCRIPTEN_KEEPALIVE int opus_decode_packet(OpusHandle* handle, uint8_t* data, i
 	if (ff_opus_parse_packet(&s->packet, data, size, 0) < 0) {
 		return ERROR_INVALID;
 	}
-	if (s->packet.mode != OPUS_MODE_SILK) {
+	if (s->packet.mode == OPUS_MODE_HYBRID) {
 		return OPUS_ERROR_UNSUPPORTED;
 	}
 	s->silk_samplerate = get_silk_samplerate(s->packet.config);

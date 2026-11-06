@@ -1,6 +1,6 @@
 /*
  * Extracts the Opus constant tables verbatim from FFmpeg's libavcodec/opus/tab.c and frame_duration_tab.c into opus_tables.h.
- * PREFIXES names which of tab.c's tables go in: add "ff_celt_" for the CELT layer.
+ * PREFIXES names which of tab.c's tables go in.
  *
  * Re-run only when re-basing on a newer FFmpeg; the generated header is committed, so a normal build does not need FFmpeg's tree:
  *
@@ -10,17 +10,18 @@ import fs from "node:fs";
 import path from "node:path";
 import {fileURLToPath} from "node:url";
 
-const PREFIXES = ["ff_silk_"];
+const PREFIXES = ["ff_silk_", "ff_celt_", "celt_pvq_u", "ff_opus_deemph_weights"];
 
 const sourceDir = process.argv[2];
 const output = path.join(path.dirname(fileURLToPath(import.meta.url)), "opus_tables.h");
 
-/** Every top-level `const type name[..]... = {...};` of `source` whose name `wanted` accepts, as text. */
+/** Every top-level table of `source` whose name `wanted` accepts, as text: plain, static, DECLARE_ALIGNED or a table of pointers. */
 function tables(source, wanted)
 {
 	const found = [];
-	for (const match of source.matchAll(/^const (\w+) (\w+)((?:\[\w*\])+)\s*=\s*\{/gm)) {
-		const [head, , name] = match;
+	const declaration = /^(?:static )?(?:const (\w+)(?: \* const)? |DECLARE_ALIGNED\(\d+, const (\w+), )(\w+)\)?((?:\[\w*\])+)\s*=\s*\{/gm;
+	for (const match of source.matchAll(declaration)) {
+		const [head, plainType, alignedType, name, dimensions] = match;
 		if (!wanted(name)) {
 			continue;
 		}
@@ -30,7 +31,8 @@ function tables(source, wanted)
 			if (source[i] === "{") {
 				++depth;
 			} else if (source[i] === "}" && --depth === 0) {
-				found.push("static " + source.slice(match.index, i + 1) + ";");
+				const pointer = head.includes("* const") ? "* const " : "";
+				found.push(`static const ${plainType ?? alignedType} ${pointer}${name}${dimensions} = ` + source.slice(open, i + 1) + ";");
 				break;
 			}
 		}
@@ -53,6 +55,7 @@ const lines = [
 	...tables(durations, name => name === "ff_opus_frame_duration"),
 	"",
 ];
+lines.push("#define CELT_EMPH_COEFF 0.8500061035", "");
 for (const table of tables(tab, name => PREFIXES.some(prefix => name.startsWith(prefix)))) {
 	lines.push(table, "");
 }
@@ -60,6 +63,8 @@ for (const table of tables(tab, name => PREFIXES.some(prefix => name.startsWith(
 lines.push(
 	"#define ff_silk_model_pitch_lowbits_nb ff_silk_model_lcg_seed",
 	"#define ff_silk_model_pitch_lowbits_wb ff_silk_model_gain_lowbits",
+	"#define ff_celt_model_energy_small ff_celt_model_tapset",
+	"#define ff_celt_window (ff_celt_window_padded + 8)",
 	"",
 );
 fs.writeFileSync(output, lines.join("\n"));
