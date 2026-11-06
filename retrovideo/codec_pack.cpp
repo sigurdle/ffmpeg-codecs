@@ -50,9 +50,10 @@ static int g_use_simd = 1;
 #include "iv3_decode.h"       // iv3::  standalone Indeo 3 cell-tree / VQ decoder
 
 // ── public enums (kept in lockstep with retrovideo_decode_core.js) ──
-enum { RV_CVID = 0, RV_MSV1 = 1, RV_IV2 = 2, RV_IV3 = 3, RV_IV4 = 4, RV_IV5 = 5, RV_MSRLE = 6, RV_QTRLE = 7, RV_RPZA = 8, RV_SMC = 9, RV_8BPS = 10, RV_HFYU = 11 };
-enum { RV_FMT_RGB24 = 0, RV_FMT_RGB555 = 1, RV_FMT_INDEX8 = 2, RV_FMT_YCBCR410 = 3, RV_FMT_ARGB32 = 4 };
+enum { RV_CVID = 0, RV_MSV1 = 1, RV_IV2 = 2, RV_IV3 = 3, RV_IV4 = 4, RV_IV5 = 5, RV_MSRLE = 6, RV_QTRLE = 7, RV_RPZA = 8, RV_SMC = 9, RV_8BPS = 10, RV_HFYU = 11, RV_DV = 12 };
+enum { RV_FMT_RGB24 = 0, RV_FMT_RGB555 = 1, RV_FMT_INDEX8 = 2, RV_FMT_YCBCR410 = 3, RV_FMT_ARGB32 = 4, RV_FMT_YCBCR420 = 5, RV_FMT_YCBCR422 = 6 };
 enum { RV_FLAG_PALETTED = 1 };   // bit 0: 8-bit/paletted mode (cinepak & msvideo1)
+enum { RV_FLAG_DV_SL25 = 2 };    // bit 1: DV tagged SL25, whose frames may not say they are 4:1:1
 // Bits 8 and up of the open flags: the coded depth, for the RLE codecs.
 enum { RV_FLAG_DEPTH_SHIFT = 8 };
 
@@ -81,6 +82,8 @@ static inline uint32_t AV_RB16(const uint8_t* p) { return ((uint32_t)p[0] << 8) 
 static inline uint32_t AV_RB24(const uint8_t* p) { return ((uint32_t)p[0] << 16) | ((uint32_t)p[1] << 8) | p[2]; }
 static inline uint32_t AV_RB32(const uint8_t* p) { return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3]; }
 static inline uint32_t AV_RL16(const uint8_t* p) { return ((uint32_t)p[1] << 8) | p[0]; }
+
+namespace dv { struct Ctx; }
 
 // ── unified handle ──
 struct RvCtx {
@@ -132,6 +135,7 @@ struct RvCtx {
 	uint8_t  smcOctets[256 * 8];
 
 	struct HyuvCtx* hyuv;   // HuffYUV, set up by rv_set_extradata
+	dv::Ctx* dv;            // DV; its frames set the picture's size and format
 };
 
 // A finished block picture, tight, into the output frame.
@@ -147,6 +151,7 @@ static void block_pic_finish(RvCtx* s) {
 #include "smc_decode.h"   // smc::
 #include "eightbps_decode.h"   // eightbps::
 #include "huffyuv_decode.h"    // hfyu::
+#include "dv_decode.h"         // dv::
 
 // ════════════════════════════════════════════════════════════════════════════
 //  Cinepak (CVID) — port of FFmpeg libavcodec/cinepak.c
@@ -1734,6 +1739,14 @@ RvCtx* rv_open(int codecId, int width, int height, int flags) {
 		s->bpp    = 4;
 		s->stride = s->width * 4;
 		break;
+	case RV_DV:
+		// Room for Y then Cb,Cr as 4:2:2 at the container's size, for a picture before the first frame.
+		s->width  = width;
+		s->height = height;
+		s->format = RV_FMT_YCBCR420;
+		s->bpp    = 1;
+		s->stride = s->width * 2;
+		break;
 	case RV_IV2:
 		s->width   = width;
 		s->height  = height;
@@ -1786,6 +1799,10 @@ RvCtx* rv_open(int codecId, int width, int height, int flags) {
 	s->frameSize = (size_t)s->stride * s->height;
 	s->frame = (uint8_t*)calloc(s->frameSize ? s->frameSize : 1, 1);
 	if (!s->frame) { free(s->rlePic); free(s->blockPic); free(s->cvid_codebooks); free(s->plane1); free(s->plane2); free(s); return nullptr; }
+	if (codecId == RV_DV) {
+		dv::black(s);
+		dv::open(s, (flags & RV_FLAG_DV_SL25) && width == 720 && height == 576);
+	}
 	return s;
 }
 
@@ -1794,6 +1811,7 @@ void rv_close(RvCtx* s) {
 	ivi::ctx_free(s->ivi);
 	iv3::close(s->iv3);
 	hfyu::close(s->hyuv);
+	dv::close(s->dv);
 	free(s->rlePic);
 	free(s->blockPic);
 	free(s->cvid_codebooks);
@@ -1835,6 +1853,7 @@ int rv_decode_frame(RvCtx* s, const uint8_t* data, int len, int32_t* info) {
 		case RV_SMC:  r = smc::decode(s, data, len); break;
 		case RV_8BPS: r = eightbps::decode(s, data, len); break;
 		case RV_HFYU: r = hfyu::decode(s, data, len); break;
+		case RV_DV:   r = dv::decode(s, data, len); break;
 		}
 		ok = (r == 0) ? 1 : 0;
 		if (info) {
