@@ -8,3 +8,6 @@
 # committed *_tables.h from an FFmpeg checkout and are part of the scripts used
 # to produce the decoder.
 !extract_tables.mjs
+
+# ...and so is a JS file that holds ported tables: its FFmpeg-derived data ships in the app.
+!qt_palette.js
