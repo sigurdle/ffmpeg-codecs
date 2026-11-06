@@ -49,7 +49,7 @@ static int g_use_simd = 1;
 #include "iv3_decode.h"       // iv3::  standalone Indeo 3 cell-tree / VQ decoder
 
 // ── public enums (kept in lockstep with retrovideo_decode_core.js) ──
-enum { RV_CVID = 0, RV_MSV1 = 1, RV_IV2 = 2, RV_IV3 = 3, RV_IV4 = 4, RV_IV5 = 5, RV_MSRLE = 6, RV_QTRLE = 7 };
+enum { RV_CVID = 0, RV_MSV1 = 1, RV_IV2 = 2, RV_IV3 = 3, RV_IV4 = 4, RV_IV5 = 5, RV_MSRLE = 6, RV_QTRLE = 7, RV_RPZA = 8, RV_SMC = 9 };
 enum { RV_FMT_RGB24 = 0, RV_FMT_RGB555 = 1, RV_FMT_INDEX8 = 2, RV_FMT_YCBCR410 = 3, RV_FMT_ARGB32 = 4 };
 enum { RV_FLAG_PALETTED = 1 };   // bit 0: 8-bit/paletted mode (cinepak & msvideo1)
 // Bits 8 and up of the open flags: the coded depth, for the RLE codecs.
@@ -118,9 +118,30 @@ struct RvCtx {
 	int      depth;
 	uint8_t* rlePic;
 	int      rleStride;
+
+	// Apple Video and Apple Graphics decode into blockPic (owned), whole 4x4 blocks:
+	// rows of blockStride bytes, the height rounded up to a block.
+	uint8_t* blockPic;
+	int      blockStride;
+	size_t   blockPicSize;
+
+	// Apple Graphics color tables, kept across frames as FFmpeg keeps them.
+	uint8_t  smcPairs[256 * 2];
+	uint8_t  smcQuads[256 * 4];
+	uint8_t  smcOctets[256 * 8];
 };
 
+// A finished block picture, tight, into the output frame.
+static void block_pic_finish(RvCtx* s) {
+	const int rowBytes = s->width * s->bpp;
+	for (int y = 0; y < s->height; y++) {
+		memcpy(s->frame + (size_t)y * s->stride, s->blockPic + (size_t)y * s->blockStride, rowBytes);
+	}
+}
+
 #include "rle_decode.h"   // msrle::, qtrle::
+#include "rpza_decode.h"  // rpza::
+#include "smc_decode.h"   // smc::
 
 // ════════════════════════════════════════════════════════════════════════════
 //  Cinepak (CVID) — port of FFmpeg libavcodec/cinepak.c
@@ -1678,6 +1699,18 @@ RvCtx* rv_open(int codecId, int width, int height, int flags) {
 			if (!s->rlePic) { free(s); return nullptr; }
 		}
 		break;
+	case RV_RPZA:
+	case RV_SMC:
+		s->width  = width;
+		s->height = height;
+		s->format = codecId == RV_RPZA ? RV_FMT_RGB555 : RV_FMT_INDEX8;
+		s->bpp    = codecId == RV_RPZA ? 2 : 1;
+		s->stride = s->width * s->bpp;
+		s->blockStride  = ((s->width + 3) & ~3) * s->bpp;
+		s->blockPicSize = (size_t)s->blockStride * ((s->height + 3) & ~3);
+		s->blockPic = (uint8_t*)calloc(s->blockPicSize ? s->blockPicSize : 1, 1);
+		if (!s->blockPic) { free(s); return nullptr; }
+		break;
 	case RV_IV2:
 		s->width   = width;
 		s->height  = height;
@@ -1729,7 +1762,7 @@ RvCtx* rv_open(int codecId, int width, int height, int flags) {
 
 	s->frameSize = (size_t)s->stride * s->height;
 	s->frame = (uint8_t*)calloc(s->frameSize ? s->frameSize : 1, 1);
-	if (!s->frame) { free(s->rlePic); free(s->cvid_codebooks); free(s->plane1); free(s->plane2); free(s); return nullptr; }
+	if (!s->frame) { free(s->rlePic); free(s->blockPic); free(s->cvid_codebooks); free(s->plane1); free(s->plane2); free(s); return nullptr; }
 	return s;
 }
 
@@ -1738,6 +1771,7 @@ void rv_close(RvCtx* s) {
 	ivi::ctx_free(s->ivi);
 	iv3::close(s->iv3);
 	free(s->rlePic);
+	free(s->blockPic);
 	free(s->cvid_codebooks);
 	free(s->plane1);
 	free(s->plane2);
@@ -1752,6 +1786,7 @@ void rv_reset(RvCtx* s) {
 	if (!s) return;
 	if (s->frame) memset(s->frame, 0, s->frameSize);
 	if (s->rlePic) memset(s->rlePic, 0, (size_t)s->rleStride * s->height);
+	if (s->blockPic) memset(s->blockPic, 0, s->blockPicSize);
 	if (s->plane1) memset(s->plane1, 0, (size_t)s->chromaW * s->chromaH);
 	if (s->plane2) memset(s->plane2, 0, (size_t)s->chromaW * s->chromaH);
 	if (s->ivi) ivi::ctx_reset(s->ivi);
@@ -1772,6 +1807,8 @@ int rv_decode_frame(RvCtx* s, const uint8_t* data, int len, int32_t* info) {
 		case RV_IV5:  r = iv_decode(s, data, len); break;
 		case RV_MSRLE: r = msrle::decode(s, data, len); break;
 		case RV_QTRLE: r = qtrle::decode(s, data, len); break;
+		case RV_RPZA: r = rpza::decode(s, data, len); break;
+		case RV_SMC:  r = smc::decode(s, data, len); break;
 		}
 		ok = (r == 0) ? 1 : 0;
 		if (info) {
