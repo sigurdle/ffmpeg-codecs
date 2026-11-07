@@ -1613,6 +1613,10 @@ static int vorbis_parse_audio_packet(vorbis_context* vc, float** floor_ptr)
 	// Dotproduct, MDCT
 	for (j = vc->audio_channels - 1; j >= 0; j--) {
 		ch_res_ptr = vc->channel_residues + res_chan[j] * blocksize / 2;
+		if (no_residue[j]) {
+			memset(ch_res_ptr, 0, (blocksize / 2) * sizeof(float));
+			continue;
+		}
 		float* floor_channel = floor_ptr[j];
 		for (unsigned n = 0; n < blocksize / 2; n++) floor_channel[n] *= ch_res_ptr[n];
 		imdct_half(&vc->mdct[blockflag], ch_res_ptr, floor_channel);

@@ -1,5 +1,5 @@
 /*
-	AAC-LC audio decoder -- WASM C++.
+	AAC-LC and HE-AAC v1 audio decoder -- WASM C++.
 
 	A direct port of FFmpeg's native AAC decoder (libavcodec, tag n8.1):
 	  aac/aacdec.c / aac/aacdec_float.c / aac/aacdec_float_coupling.h /
@@ -16,18 +16,17 @@
 	License for more details. Copyright is held by the FFmpeg authors: Oded Shimon, Maxim
 	Gavrilov, Alex Converse, Paul Kendall, Janne Grunau and the others named in the files above.
 
-	Scope -- AAC-LC at 1024 samples per frame, float output, as the containers we read
-	carry it: AudioSpecificConfig (or ADTS headers), raw_data_block with SCE, CPE, CCE, LFE,
+	Scope -- AAC-LC at 1024 samples per frame, and SBR over it at 2048 (aac_sbr.h, pinned to
+	FFmpeg n9.0.2), float output, as the containers we read carry it: AudioSpecificConfig (or ADTS headers), raw_data_block with SCE, CPE, CCE, LFE,
 	DSE, PCE and FIL; ICS, section data, scale factors, spectral Huffman, pulses, M/S,
 	intensity, PNS, TNS, coupling; long, start, eight-short and stop windows, sine and KBD.
 	Everything else is refused, never approximated: Main, SSR, LTP, ER, LD, ELD, USAC, and
 	the 960-sample frame length.
 
-	SBR and PS are not decoded. An SBR payload is skipped, its low band plays at the core
-	rate, and aac_configure / aac_decode_frame report sbrPresent so that a reader can warn
-	that an HE-AAC stream plays its LC core at half rate. The flag is set where FFmpeg would
-	turn SBR on: AOT 5 or 29, an explicit extension in the AudioSpecificConfig, or an
-	EXT_SBR_DATA fill element FFmpeg accepts.
+	SBR turns on where FFmpeg turns it on: AOT 5 or 29, an explicit extension in the
+	AudioSpecificConfig, or an EXT_SBR_DATA fill element in the first frame. The last is why a
+	stream's rate and frame size may only be known once a frame has decoded. Parametric Stereo
+	is not decoded: a stream carrying it plays its mono core, and aac_decode_frame says so.
 
 	Differences from FFmpeg, all behavior-preserving for that scope:
 	  - The surrounding framework (AVCodecContext / AVFrame / the DSP function pointers /
@@ -57,14 +56,14 @@
 	Boundary (extern "C", prefixed _ on the JS side; see aac_decode_core.js):
 	  AACContext* aac_open(void)
 	  void    aac_close(AACContext*)
-	  void    aac_reset(AACContext*)
+	  void    aac_reset(AACContext*, int frame)    the next frame's number in the stream
 	  int     aac_configure(AACContext*, uint8_t* asc, int size, int info[4])
-	            info = {sampleRate, channels, objectType, sbrPresent}; 1, 0 when invalid or
-	            not LC. `asc` has room for AAC_INPUT_PADDING bytes past `size`.
+	            info = {sampleRate, channels, objectType, sbrPresent}, the output's rate; 1, 0
+	            when invalid or not LC. `asc` has room for AAC_INPUT_PADDING bytes past `size`.
 	  int     aac_decode_frame(AACContext*, uint8_t* data, int size, int info[12])
 	            decode one raw_data_block, or one ADTS frame; info as AAC_INFO_* below; 1, 0 on
 	            error. `data` has room for AAC_INPUT_PADDING bytes past `size`.
-	  float*  aac_channel_ptr(AACContext*, int ch)    planar output, 1024 samples
+	  float*  aac_channel_ptr(AACContext*, int ch)    planar output, 1024 or 2048 samples
 	  int     aac_test_imdct(int n)                   max error x 1e9 against the definition
 */
 
@@ -106,6 +105,7 @@ enum CouplingPoint { BEFORE_TNS, BETWEEN_TNS_AND_IMDCT, AFTER_IMDCT = 3 };
 enum { AOT_AAC_LC = 2, AOT_SBR = 5, AOT_ER_BSAC = 22, AOT_ESCAPE = 31, AOT_PS = 29, AOT_NULL = 0 };
 
 #include "aac_tables.h"
+#include "aac_sbr_tables.h"
 
 static const int ff_mpeg4audio_sample_rates[16] = {
 	96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350,
@@ -115,7 +115,7 @@ static const uint8_t ff_mpeg4audio_channels[15] = { 0, 1, 2, 3, 4, 5, 6, 8, 0, 0
 // What aac_decode_frame answers. The counts cover one frame; they let a conformance run prove it
 // exercised a tool, which is otherwise easy to leave silently untested.
 enum {
-	AAC_INFO_SAMPLE_RATE, AAC_INFO_CHANNELS, AAC_INFO_SAMPLES, AAC_INFO_SBR_PRESENT,
+	AAC_INFO_SAMPLE_RATE, AAC_INFO_CHANNELS, AAC_INFO_SAMPLES, AAC_INFO_PS_PRESENT,
 	AAC_INFO_SHORT, AAC_INFO_KBD, AAC_INFO_PNS, AAC_INFO_INTENSITY, AAC_INFO_MS, AAC_INFO_TNS,
 	AAC_INFO_PULSE, AAC_INFO_CCE, AAC_INFO_COUNT,
 };
@@ -176,10 +176,11 @@ static inline void align_get_bits(GetBitContext* s)
 struct VLCElem { uint16_t sym; int16_t len; };
 struct VLC { const VLCElem* table; int bits; };
 
-static VLCElem g_vlc_pool[16384];
+static VLCElem g_vlc_pool[32768];
 static int g_vlc_used;
 static VLC g_vlc_spectral[11];
 static VLC g_vlc_scalefactors;
+static VLC g_vlc_sbr[10];
 
 /** `code(i)`, `len(i)`, `sym(i)` for n codes. Returns 0 if the pool is too small. */
 template <class CodeAt, class LenAt, class SymAt>
@@ -267,6 +268,8 @@ struct Cpx { double re, im; };
 // MDCT twiddles and the FFT's, for the 512- and 64-point complex transforms inside.
 static Cpx g_mdct_exp_long[512];
 static Cpx g_mdct_exp_short[64];
+static Cpx g_sbr_exp_analysis[32];
+static Cpx g_sbr_exp_synthesis[32];
 static Cpx g_fft_tw[256];
 
 static double bessel_i0(double x)
@@ -310,15 +313,16 @@ static void sine_window_init(float* window, int n)
 	for (int i = 0; i < n; i++) window[i] = sinf((float)((i + 0.5) * (M_PI / (2.0 * n))));
 }
 
-static void mdct_exp_init(Cpx* exp, int len)
+static void mdct_exp_init(Cpx* exp, int len, double scale)
 {
 	// ff_tx_mdct_gen_exp: a scale whose root goes on each of the pre- and post-rotation.
 	const int len2 = len >> 1;
-	const double scale = sqrt(1.0 / len / 32768.0);
+	const double theta = (scale < 0 ? len2 : 0) + 1.0 / 8.0;
+	const double root = sqrt(fabs(scale));
 	for (int i = 0; i < len2; i++) {
-		const double alpha = M_PI_2 * (i + 1.0 / 8.0) / len2;
-		exp[i].re = cos(alpha) * scale;
-		exp[i].im = sin(alpha) * scale;
+		const double alpha = M_PI_2 * (i + theta) / len2;
+		exp[i].re = cos(alpha) * root;
+		exp[i].im = sin(alpha) * root;
 	}
 }
 
@@ -341,6 +345,22 @@ static int tables_init(void)
 			[](int i) { return (uint16_t)i; }))
 		return 0;
 
+	// ff_vlc_init_tables_from_lengths: the codes are canonical, in table order.
+	const uint8_t (*tab)[2] = sbr_huffman_tab;
+	for (int table = 0; table < 10; table++) {
+		const int n = sbr_huffman_nb_codes[table];
+		static uint32_t codes[121];
+		uint32_t code = 0;
+		for (int i = 0; i < n; i++) {
+			codes[i] = code >> (32 - tab[i][1]);
+			code += 1u << (32 - tab[i][1]);
+		}
+		if (!vlc_build(&g_vlc_sbr[table], 9, n, [](int i) { return codes[i]; }, [=](int i) { return (int)tab[i][1]; },
+				[=](int i) { return (uint16_t)tab[i][0]; }))
+			return 0;
+		tab += n;
+	}
+
 	for (int i = 0; i < 428; i++) g_pow2sf_tab[i] = (float)pow(2.0, (i - POW_SF2_ZERO) / 4.0);
 	for (int i = 0; i < (1 << 13); i++) g_cbrt_tab[i] = (float)(i * cbrt((double)i));
 
@@ -349,8 +369,11 @@ static int tables_init(void)
 	kbd_window_init(g_kbd_long_1024, 4.0, 1024);
 	kbd_window_init(g_kbd_short_128, 6.0, 128);
 
-	mdct_exp_init(g_mdct_exp_long, 1024);
-	mdct_exp_init(g_mdct_exp_short, 128);
+	mdct_exp_init(g_mdct_exp_long, 1024, 1.0 / 1024 / 32768.0);
+	mdct_exp_init(g_mdct_exp_short, 128, 1.0 / 128 / 32768.0);
+	// SBR works on samples scaled to +/-32768, so analysis scales up and synthesis back down.
+	mdct_exp_init(g_sbr_exp_analysis, 64, -2.0 * 32768);
+	mdct_exp_init(g_sbr_exp_synthesis, 64, 1.0 / (64 * 32768));
 	for (int i = 0; i < 256; i++) {
 		const double ang = 2.0 * M_PI * i / 512;
 		g_fft_tw[i].re = cos(ang);
@@ -392,10 +415,9 @@ static void fft_inverse(Cpx* z, int n)
 	}
 }
 
-static void imdct_half(float* dst, const float* src, int len)
+static void imdct_half_exp(float* dst, const float* src, int len, const Cpx* exp)
 {
 	static Cpx z[512];
-	const Cpx* exp = len == 1024 ? g_mdct_exp_long : g_mdct_exp_short;
 	const int len2 = len >> 1;
 	const int len4 = len >> 2;
 
@@ -423,6 +445,11 @@ static void imdct_half(float* dst, const float* src, int len)
 		dst[2 * i] = (float)z[i].re;
 		dst[2 * i + 1] = (float)z[i].im;
 	}
+}
+
+static void imdct_half(float* dst, const float* src, int len)
+{
+	imdct_half_exp(dst, src, len, len == 1024 ? g_mdct_exp_long : g_mdct_exp_short);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -494,7 +521,7 @@ struct SingleChannelElement {
 	float sf[128];
 	float coeffs[1024];
 	float saved[1024];
-	float ret_buf[1024];
+	float ret_buf[2048];	// 1024 samples, or 2048 once SBR has run over them
 };
 
 struct ChannelElement {
@@ -513,12 +540,15 @@ struct AACContext {
 	int tags_mapped;
 	int channels;
 	int random_state;
-	int sbr_present;
+	int ps_present;			// Parametric Stereo data was seen and stepped over
+	int seek_frame;			// what aac_reset was told, for an element that first shows up after it
 	int stats[AAC_INFO_COUNT];
 	float buf_mdct[1024];
 	float temp[128];
-	float silence[1024];
+	float silence[2048];
 };
+
+#include "aac_sbr.h"
 
 ///////////////////////////////////////////////////////////////////////////////
 // Channel configuration (aacdec.c)
@@ -528,8 +558,10 @@ static int che_configure(AACContext* ac, int che_pos, int type, int id, int* cha
 	if (*channels >= MAX_CHANNELS) return AVERROR_INVALIDDATA;
 	if (che_pos) {
 		if (!ac->che[type][id]) {
-			ac->che[type][id] = (ChannelElement*)calloc(1, sizeof(ChannelElement));
+			ac->che[type][id] = (ChannelElement*)malloc(sizeof(ExtChannelElement));
 			if (!ac->che[type][id]) return AVERROR_INVALIDDATA;
+			memset(ac->che[type][id], 0, sizeof(ChannelElement));
+			sbr_ctx_init(get_sbr(ac->che[type][id]), type, ac->seek_frame);
 		}
 		if (type != TYPE_CCE) {
 			if (*channels >= MAX_CHANNELS - (type == TYPE_CPE)) return AVERROR_INVALIDDATA;
@@ -937,6 +969,17 @@ static int decode_pce(uint8_t (*layout_map)[3], GetBitContext* gb, int byte_alig
 	return tags;
 }
 
+static int count_channels(uint8_t (*layout)[3], int tags)
+{
+	int sum = 0;
+	for (int i = 0; i < tags; i++) {
+		const int syn_ele = layout[i][0];
+		const int pos = layout[i][2];
+		sum += (1 + (syn_ele == TYPE_CPE)) * (pos != AAC_CHANNEL_OFF && pos != AAC_CHANNEL_CC);
+	}
+	return sum;
+}
+
 static int decode_ga_specific_config(AACContext* ac, GetBitContext* gb, int channel_config)
 {
 	uint8_t layout_map[MAX_ELEM_ID * 4][3];
@@ -953,6 +996,12 @@ static int decode_ga_specific_config(AACContext* ac, GetBitContext* gb, int chan
 	} else {
 		const int ret = set_default_channel_config(layout_map, &tags, channel_config);
 		if (ret) return ret;
+	}
+
+	if (count_channels(layout_map, tags) > 1) {
+		ac->oc[1].m4ac.ps = 0;
+	} else if (ac->oc[1].m4ac.sbr == 1 && ac->oc[1].m4ac.ps == -1) {
+		ac->oc[1].m4ac.ps = 1;
 	}
 
 	const int ret = output_configure(ac, layout_map, tags, OC_GLOBAL_HDR);
@@ -1036,7 +1085,6 @@ static int decode_audio_specific_config(AACContext* ac, const uint8_t* data, int
 	skip_bits_long(&gb, i);
 
 	if (m4ac->object_type != AOT_AAC_LC) return AVERROR_UNSUPPORTED;
-	if (m4ac->sbr == 1) ac->sbr_present = 1;
 	return decode_ga_specific_config(ac, &gb, m4ac->chan_config);
 }
 
@@ -1749,21 +1797,33 @@ static int decode_dynamic_range(GetBitContext* gb)
 	return n;
 }
 
-/** Returns bytes consumed. SBR is skipped where FFmpeg would decode it, and noted. */
-static int decode_extension_payload(AACContext* ac, GetBitContext* gb, int cnt, ChannelElement* che)
+/** Returns bytes consumed. */
+static int decode_extension_payload(AACContext* ac, GetBitContext* gb, int cnt, ChannelElement* che, int elem_type)
 {
+	int crc_flag = 0;
 	int res = cnt;
 	const int type = get_bits(gb, 4);
 
 	switch (type) {
 	case EXT_SBR_DATA_CRC:
+		crc_flag++;
+		// fall through
 	case EXT_SBR_DATA:
-		if (!che) return res;
-		if (ac->oc[1].m4ac.sbr && !(ac->oc[1].m4ac.sbr == -1 && ac->oc[1].status == OC_LOCKED)) {
+		if (!che) {
+			return res;
+		} else if (!ac->oc[1].m4ac.sbr) {
+			skip_bits_long(gb, 8 * cnt - 4);
+			return res;
+		} else if (ac->oc[1].m4ac.sbr == -1 && ac->oc[1].status == OC_LOCKED) {
+			skip_bits_long(gb, 8 * cnt - 4);
+			return res;
+		} else if (ac->oc[1].m4ac.ps == -1 && ac->oc[1].status < OC_LOCKED && ac->channels == 1) {
 			ac->oc[1].m4ac.sbr = 1;
-			ac->sbr_present = 1;
+			ac->oc[1].m4ac.ps = 1;
+		} else {
+			ac->oc[1].m4ac.sbr = 1;
 		}
-		skip_bits_long(gb, 8 * cnt - 4);
+		sbr_decode_extension(ac, che, gb, crc_flag, cnt, elem_type, 0);
 		break;
 	case EXT_DYNAMIC_RANGE:
 		res = decode_dynamic_range(gb);
@@ -1962,6 +2022,7 @@ static void spectral_to_sample(AACContext* ac)
 				if (type != TYPE_CCE || che->coup.coupling_point == AFTER_IMDCT) {
 					imdct_and_windowing(ac, &che->ch[0]);
 					if (type == TYPE_CPE) imdct_and_windowing(ac, &che->ch[1]);
+					if (ac->oc[1].m4ac.sbr > 0) sbr_apply(ac, che, type, 0, che->ch[0].ret_buf, che->ch[1].ret_buf);
 				}
 				if (type <= TYPE_CCE) apply_channel_coupling(ac, che, type, i, AFTER_IMDCT, apply_independent_coupling);
 				che->present = 0;
@@ -2016,6 +2077,12 @@ static int parse_adts_frame_header(AACContext* ac, GetBitContext* gb)
 }
 
 /** Returns 0, or an error; *samples is what the frame gave. */
+static int output_rate_shift(const AACContext* ac)
+{
+	const MPEG4AudioConfig* m4ac = &ac->oc[1].m4ac;
+	return m4ac->sbr == 1 && m4ac->ext_sample_rate > m4ac->sample_rate;
+}
+
 static int decode_frame_ga(AACContext* ac, GetBitContext* gb, int* samples)
 {
 	int err;
@@ -2024,6 +2091,7 @@ static int decode_frame_ga(AACContext* ac, GetBitContext* gb, int* samples)
 	uint8_t che_presence[4][MAX_ELEM_ID];
 	ChannelElement* che = NULL;
 	ChannelElement* che_prev = NULL;
+	int che_prev_type = TYPE_END;
 	int audio_found = 0, pce_found = 0;
 
 	memset(che_presence, 0, sizeof(che_presence));
@@ -2090,7 +2158,7 @@ static int decode_frame_ga(AACContext* ac, GetBitContext* gb, int* samples)
 			if (get_bits_left(gb) < 8 * elem_id) return AVERROR_INVALIDDATA;
 			err = 0;
 			while (elem_id > 0) {
-				const int ret = decode_extension_payload(ac, gb, elem_id, che_prev);
+				const int ret = decode_extension_payload(ac, gb, elem_id, che_prev, che_prev_type);
 				if (ret < 0) {
 					err = ret;
 					break;
@@ -2103,7 +2171,10 @@ static int decode_frame_ga(AACContext* ac, GetBitContext* gb, int* samples)
 			break;
 		}
 
-		if (elem_type < TYPE_DSE) che_prev = che;
+		if (elem_type < TYPE_DSE) {
+			che_prev = che;
+			che_prev_type = elem_type;
+		}
 
 		if (err) return err;
 
@@ -2111,6 +2182,10 @@ static int decode_frame_ga(AACContext* ac, GetBitContext* gb, int* samples)
 	}
 
 	if (!ac->channels) return 0;
+
+	if (*samples && ac->oc[1].m4ac.sample_rate <= 0) return AVERROR_INVALIDDATA;
+
+	*samples <<= output_rate_shift(ac);
 
 	spectral_to_sample(ac);
 
@@ -2142,8 +2217,9 @@ void aac_close(AACContext* ac)
 	free(ac);
 }
 
-void aac_reset(AACContext* ac)
+void aac_reset(AACContext* ac, int frame)
 {
+	ac->seek_frame = frame;
 	for (int type = 3; type >= 0; type--) {
 		for (int i = 0; i < MAX_ELEM_ID; i++) {
 			ChannelElement* che = ac->che[type][i];
@@ -2152,6 +2228,7 @@ void aac_reset(AACContext* ac)
 					memset(che->ch[j].saved, 0, sizeof(che->ch[j].saved));
 					memset(&che->ch[j].ics, 0, sizeof(che->ch[j].ics));
 				}
+				sbr_ctx_init(get_sbr(che), type, frame);
 			}
 		}
 	}
@@ -2162,10 +2239,10 @@ int aac_configure(AACContext* ac, uint8_t* asc, int size, int* info)
 {
 	memset(asc + size, 0, AAC_INPUT_PADDING);
 	const int err = decode_audio_specific_config(ac, asc, size * 8);
-	info[0] = ac->oc[1].m4ac.sample_rate;
+	info[0] = ac->oc[1].m4ac.sample_rate << output_rate_shift(ac);
 	info[1] = ac->channels;
 	info[2] = ac->oc[1].m4ac.object_type;
-	info[3] = ac->sbr_present;
+	info[3] = ac->oc[1].m4ac.sbr == 1;
 	return err >= 0;
 }
 
@@ -2194,10 +2271,10 @@ int aac_decode_frame(AACContext* ac, uint8_t* data, int size, int* info)
 	if ((err = decode_frame_ga(ac, &gb, &samples)) < 0) goto fail;
 
 	memcpy(info, ac->stats, sizeof(ac->stats));
-	info[AAC_INFO_SAMPLE_RATE] = ac->oc[1].m4ac.sample_rate;
+	info[AAC_INFO_SAMPLE_RATE] = ac->oc[1].m4ac.sample_rate << output_rate_shift(ac);
 	info[AAC_INFO_CHANNELS] = ac->channels;
 	info[AAC_INFO_SAMPLES] = samples;
-	info[AAC_INFO_SBR_PRESENT] = ac->sbr_present;
+	info[AAC_INFO_PS_PRESENT] = ac->ps_present;
 	return 1;
 
 fail:
