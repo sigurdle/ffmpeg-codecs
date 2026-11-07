@@ -60,7 +60,7 @@
 	  int     aac_configure(AACContext*, uint8_t* asc, int size, int info[4])
 	            info = {sampleRate, channels, objectType, sbrPresent}, the output's rate; 1, 0
 	            when invalid or not LC. `asc` has room for AAC_INPUT_PADDING bytes past `size`.
-	  int     aac_decode_frame(AACContext*, uint8_t* data, int size, int info[12])
+	  int     aac_decode_frame(AACContext*, uint8_t* data, int size, int info[13])
 	            decode one raw_data_block, or one ADTS frame; info as AAC_INFO_* below; 1, 0 on
 	            error. `data` has room for AAC_INPUT_PADDING bytes past `size`.
 	  float*  aac_channel_ptr(AACContext*, int ch)    planar output, 1024 or 2048 samples
@@ -117,7 +117,7 @@ static const uint8_t ff_mpeg4audio_channels[15] = { 0, 1, 2, 3, 4, 5, 6, 8, 0, 0
 enum {
 	AAC_INFO_SAMPLE_RATE, AAC_INFO_CHANNELS, AAC_INFO_SAMPLES, AAC_INFO_PS_PRESENT,
 	AAC_INFO_SHORT, AAC_INFO_KBD, AAC_INFO_PNS, AAC_INFO_INTENSITY, AAC_INFO_MS, AAC_INFO_TNS,
-	AAC_INFO_PULSE, AAC_INFO_CCE, AAC_INFO_COUNT,
+	AAC_INFO_PULSE, AAC_INFO_CCE, AAC_INFO_SBR, AAC_INFO_COUNT,
 };
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -541,7 +541,7 @@ struct AACContext {
 	int channels;
 	int random_state;
 	int ps_present;			// Parametric Stereo data was seen and stepped over
-	int seek_frame;			// what aac_reset was told, for an element that first shows up after it
+	int frame_number;		// of the frame being decoded, from what aac_reset was told, for an element that first shows up later
 	int stats[AAC_INFO_COUNT];
 	float buf_mdct[1024];
 	float temp[128];
@@ -561,7 +561,7 @@ static int che_configure(AACContext* ac, int che_pos, int type, int id, int* cha
 			ac->che[type][id] = (ChannelElement*)malloc(sizeof(ExtChannelElement));
 			if (!ac->che[type][id]) return AVERROR_INVALIDDATA;
 			memset(ac->che[type][id], 0, sizeof(ChannelElement));
-			sbr_ctx_init(get_sbr(ac->che[type][id]), type, ac->seek_frame);
+			sbr_ctx_init(get_sbr(ac->che[type][id]), type, ac->frame_number);
 		}
 		if (type != TYPE_CCE) {
 			if (*channels >= MAX_CHANNELS - (type == TYPE_CPE)) return AVERROR_INVALIDDATA;
@@ -1956,7 +1956,7 @@ static void imdct_and_windowing(AACContext* ac, SingleChannelElement* sce)
 	}
 }
 
-static void apply_dependent_coupling(SingleChannelElement* target, ChannelElement* cce, int index)
+static void apply_dependent_coupling(AACContext* ac, SingleChannelElement* target, ChannelElement* cce, int index)
 {
 	IndividualChannelStream* ics = &cce->ch[0].ics;
 	const uint16_t* offsets = ics->swb_offset;
@@ -1976,16 +1976,17 @@ static void apply_dependent_coupling(SingleChannelElement* target, ChannelElemen
 	}
 }
 
-static void apply_independent_coupling(SingleChannelElement* target, ChannelElement* cce, int index)
+static void apply_independent_coupling(AACContext* ac, SingleChannelElement* target, ChannelElement* cce, int index)
 {
 	const float gain = cce->coup.gain[index][0];
 	const float* src = cce->ch[0].ret_buf;
 	float* dest = target->ret_buf;
-	for (int i = 0; i < 1024; i++) dest[i] += src[i] * gain;
+	const int len = 1024 << (ac->oc[1].m4ac.sbr == 1);
+	for (int i = 0; i < len; i++) dest[i] += src[i] * gain;
 }
 
 static void apply_channel_coupling(AACContext* ac, ChannelElement* cc, int type, int elem_id, CouplingPoint coupling_point,
-	void (*apply_coupling_method)(SingleChannelElement* target, ChannelElement* cce, int index))
+	void (*apply_coupling_method)(AACContext* ac, SingleChannelElement* target, ChannelElement* cce, int index))
 {
 	for (int i = 0; i < MAX_ELEM_ID; i++) {
 		ChannelElement* cce = ac->che[TYPE_CCE][i];
@@ -1997,10 +1998,10 @@ static void apply_channel_coupling(AACContext* ac, ChannelElement* cc, int type,
 			for (int c = 0; c <= coup->num_coupled; c++) {
 				if (coup->type[c] == type && coup->id_select[c] == elem_id) {
 					if (coup->ch_select[c] != 1) {
-						apply_coupling_method(&cc->ch[0], cce, index);
+						apply_coupling_method(ac, &cc->ch[0], cce, index);
 						if (coup->ch_select[c] != 0) index++;
 					}
-					if (coup->ch_select[c] != 2) apply_coupling_method(&cc->ch[1], cce, index++);
+					if (coup->ch_select[c] != 2) apply_coupling_method(ac, &cc->ch[1], cce, index++);
 				} else {
 					index += 1 + (coup->ch_select[c] == 3);
 				}
@@ -2219,7 +2220,7 @@ void aac_close(AACContext* ac)
 
 void aac_reset(AACContext* ac, int frame)
 {
-	ac->seek_frame = frame;
+	ac->frame_number = frame;
 	for (int type = 3; type >= 0; type--) {
 		for (int i = 0; i < MAX_ELEM_ID; i++) {
 			ChannelElement* che = ac->che[type][i];
@@ -2275,10 +2276,13 @@ int aac_decode_frame(AACContext* ac, uint8_t* data, int size, int* info)
 	info[AAC_INFO_CHANNELS] = ac->channels;
 	info[AAC_INFO_SAMPLES] = samples;
 	info[AAC_INFO_PS_PRESENT] = ac->ps_present;
+	info[AAC_INFO_SBR] = ac->oc[1].m4ac.sbr == 1;
+	ac->frame_number++;
 	return 1;
 
 fail:
 	pop_output_configuration(ac);
+	ac->frame_number++;
 	return 0;
 }
 

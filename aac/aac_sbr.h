@@ -1490,7 +1490,7 @@ static void read_sbr_extension(AACContext *ac, SpectralBandReplication *sbr,
     switch (bs_extension_id) {
     case EXTENSION_ID_PS:
         // Parametric Stereo is not decoded yet: its payload is stepped over and the core's channel plays.
-        if (ac->oc[1].m4ac.ps)
+        if (ac->oc[1].m4ac.ps == 1 || (ac->oc[1].m4ac.ps == -1 && ac->channels == 1))
             ac->ps_present = 1;
         skip_bits_long(gb, *num_bits_left); // bs_fill_bits
         *num_bits_left = 0;
