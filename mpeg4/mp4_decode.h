@@ -1449,12 +1449,13 @@ static inline int mp4_decode_vol_header(Mp4Decoder* d) {
         skip_bits(gb, 2);                              // chroma_format
         d->low_delay = get_bits1(gb);
         int vbv = get_bits1(gb);
-        if (vbv) {
-            skip_bits(gb, 15); skip_bits(gb, 1);
-            skip_bits(gb, 15); skip_bits(gb, 1);
-            skip_bits(gb, 15); skip_bits(gb, 3);
-            skip_bits(gb, 11); skip_bits(gb, 1);
-            skip_bits(gb, 15); skip_bits(gb, 1);
+        if (vbv) {                                     // ffmpeg decode_vol_header: 79 bits
+            skip_bits(gb, 15); skip_bits(gb, 1);       // first_half_bit_rate, marker
+            skip_bits(gb, 15); skip_bits(gb, 1);       // latter_half_bit_rate, marker
+            skip_bits(gb, 15); skip_bits(gb, 1);       // first_half_vbv_buffer_size, marker
+            skip_bits(gb, 3);                          // latter_half_vbv_buffer_size
+            skip_bits(gb, 11); skip_bits(gb, 1);       // first_half_vbv_occupancy, marker
+            skip_bits(gb, 15); skip_bits(gb, 1);       // latter_half_vbv_occupancy, marker
         }
     }
 
