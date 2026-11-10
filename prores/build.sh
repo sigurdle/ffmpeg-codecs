@@ -14,6 +14,8 @@
 # Outputs:
 #   ./prores_decode.{mjs,wasm}                 shipped decoder (web,worker)
 #   ../../tests/wasm/prores_codec.{mjs,wasm}   node build for the conformance test
+#   ./prores_encode.{mjs,wasm}                 shipped encoder (web,worker), from prores_encode.cpp
+#   ../../tests/wasm/prores_encode.{mjs,wasm}  node encoder build for ProResEncode.test.js
 #
 # Usage:
 #   ./build.sh            # speed build (-O3)
@@ -56,5 +58,20 @@ echo "=== link: node test build ==="
 emcc "${LINK_COMMON[@]}" -sENVIRONMENT=web,worker,node -sEXPORT_NAME=ProresCodecModule \
 	-sEXPORTED_FUNCTIONS=$EXPORTS "$OBJ" -o "$TESTDIR_W/prores_codec.mjs"
 
+# ---- encoder: a port of FFmpeg's prores_ks (proresenc_kostya.c, proresenc_kostya_common.c,
+# jfdctint_template.c 10-bit). Scalar; -fwrapv for the fdct's two's-complement wrap.
+ESRC="$HERE_W/prores_encode.cpp"
+EOBJ="$HERE_W/prores_encode.o"
+echo "compiling prores encoder ($OPT)..."
+emcc $OPT -fwrapv -ffunction-sections -fdata-sections -fno-exceptions -fno-rtti -c "$ESRC" -o "$EOBJ"
+
+EEXPORTS=_prores_enc_open,_prores_enc_close,_prores_enc_plane,_prores_enc_stride,_prores_enc_set_alpha16,_prores_enc_frame,_prores_enc_output,_prores_enc_rgba_input,_prores_enc_from_rgba16,_malloc,_free
+
+echo "=== link: shipped encoder (web,worker) ==="
+emcc "${LINK_COMMON[@]}" -sENVIRONMENT=web,worker -sEXPORT_NAME=ProresEncodeModule -sEXPORTED_FUNCTIONS=$EEXPORTS "$EOBJ" -o "$HERE_W/prores_encode.mjs"
+
+echo "=== link: node encoder test build ==="
+emcc "${LINK_COMMON[@]}" -sENVIRONMENT=web,worker,node -sEXPORT_NAME=ProresEncodeTestModule -sEXPORTED_FUNCTIONS=$EEXPORTS "$EOBJ" -o "$TESTDIR_W/prores_encode.mjs"
+
 echo "BUILD_OK"
-ls -la "$HERE_W"/prores_decode.wasm "$TESTDIR_W"/prores_codec.wasm
+ls -la "$HERE_W"/prores_decode.wasm "$TESTDIR_W"/prores_codec.wasm "$HERE_W"/prores_encode.wasm "$TESTDIR_W"/prores_encode.wasm
