@@ -42,7 +42,11 @@
 	    FFmpeg re-lays its buffer out.
 	  - Input: the 16-bit big-endian stream (sync 7F FE 80 01), which is what a DVD and the
 	    samples carry, and its byte-swapped little-endian form (FE 7F 01 80; conversion as
-	    avpriv_dca_convert_bitstream, not seen in a sample). The 14-bit forms are not taken.
+	    avpriv_dca_convert_bitstream, not seen in a sample). The 14-bit forms (1F FF E8 00 and
+	    FF 1F 00 E8: each 16-bit word carries 14 bits, what a DTS CD and a DTS .wav hold) are
+	    packed to the 16-bit stream the same way; the big-endian one is not seen in a sample.
+	    A 14-bit frame's FSIZE counts the packed bytes, so the frame stands in FSIZE * 8 / 14
+	    words: OBSERVED on dtswavsample14.wav (FSIZE 3584, a sync word every 4096 bytes).
 
 	Seek: dts_reset clears what ties a frame to the frames before it (the ADPCM history, the
 	LFE history and the filter bank's), as ff_dca_core_flush.
@@ -51,9 +55,10 @@
 	  DTSContext* dts_open(void)
 	  void    dts_close(DTSContext*)
 	  void    dts_reset(DTSContext*)
-	  int     dts_probe_frame(const uint8_t* data, int size, int info[5])   size >= 16
+	  int     dts_probe_frame(const uint8_t* data, int size, int info[5])   size >= 20
 	            info = {frameSize, sampleRate, channels, bitRate, sampleCount}; 1, 0 for what is
-	            not a core frame header
+	            not a core frame header. frameSize is the frame's bytes in the stream as it
+	            stands: a 14-bit frame takes 16 / 14 of its FSIZE
 	  int     dts_decode_frame(DTSContext*, const uint8_t* data, int size, int info[5])
 	            info = {frameSize, sampleRate, channels, sampleCount, extension}; frameSize 0 when
 	            the header did not parse; 1 when the frame decoded. extension: 0 none, else the
@@ -94,6 +99,11 @@
 
 #define DCA_SYNCWORD_CORE_BE    0x7FFE8001U
 #define DCA_SYNCWORD_CORE_LE    0xFE7F0180U
+#define DCA_SYNCWORD_CORE_14B_BE 0x1FFFE800U
+#define DCA_SYNCWORD_CORE_14B_LE 0xFF1F00E8U
+
+/* The bytes of a header in any form: 16 packed bytes are 10 words of a 14-bit stream. */
+#define DCA_PROBE_BYTES         20
 
 #define DCA_TMODE_VLC_BITS      3
 #define DCA_SCALES_VLC_BITS     9
@@ -1353,25 +1363,53 @@ static void filter_frame_float(DTSContext *s)
 /* ---------------------------------------------------------------- boundary */
 
 /*
- * dca.c avpriv_dca_convert_bitstream for the two 16-bit forms: `count` bytes at `src` as the
- * big-endian stream at `dst`. 0 for another sync word.
+ * dca.c avpriv_dca_convert_bitstream: `count` bytes at `src` as the 16-bit big-endian stream
+ * at `dst`, at most `max` bytes of it. Returns the bytes written, 0 for another sync word.
  */
-static int convert_bitstream(const uint8_t *src, int count, uint8_t *dst)
+static int convert_bitstream(const uint8_t *src, int count, uint8_t *dst, int max)
 {
 	uint32_t mrk = ((uint32_t)src[0] << 24) | (src[1] << 16) | (src[2] << 8) | src[3];
 
 	if (mrk == DCA_SYNCWORD_CORE_BE) {
+		if (count > max)
+			count = max;
 		memcpy(dst, src, count);
-		return 1;
+		return count;
 	}
 	if (mrk == DCA_SYNCWORD_CORE_LE) {
+		if (count > max)
+			count = max;
 		for (int i = 0; i + 1 < count; i += 2) {
 			dst[i] = src[i + 1];
 			dst[i + 1] = src[i];
 		}
-		return 1;
+		return count & ~1;
+	}
+	if (mrk == DCA_SYNCWORD_CORE_14B_BE || mrk == DCA_SYNCWORD_CORE_14B_LE) {
+		const int hi = (mrk == DCA_SYNCWORD_CORE_14B_BE) ? 0 : 1;
+		uint32_t acc = 0;
+		int bits = 0, n = 0;
+		for (int i = 0; i + 1 < count && n < max; i += 2) {
+			acc = (acc << 14) | ((((uint32_t)src[i + hi] << 8) | src[i + 1 - hi]) & 0x3FFF);
+			bits += 14;
+			while (bits >= 8 && n < max) {
+				bits -= 8;
+				dst[n++] = (uint8_t)(acc >> bits);
+			}
+		}
+		return n;
 	}
 	return 0;
+}
+
+/* The bytes a frame of `frame_size` packed bytes takes in the stream whose first bytes are at `src`. */
+static int stream_frame_size(const uint8_t *src, int frame_size)
+{
+	uint32_t mrk = ((uint32_t)src[0] << 24) | (src[1] << 16) | (src[2] << 8) | src[3];
+
+	if (mrk == DCA_SYNCWORD_CORE_14B_BE || mrk == DCA_SYNCWORD_CORE_14B_LE)
+		return (frame_size * 8 + 13) / 14 * 2;
+	return frame_size;
 }
 
 extern "C" {
@@ -1402,17 +1440,17 @@ int dts_probe_frame(const uint8_t *data, int size, int *info)
 	DCACoreFrameHeader h;
 	GetBitContext gb;
 
-	if (size < 16)
+	if (size < DCA_PROBE_BYTES)
 		return 0;
 	memset(head, 0, sizeof(head));
-	if (!convert_bitstream(data, 16, head))
+	if (convert_bitstream(data, DCA_PROBE_BYTES, head, 16) < 16)
 		return 0;
 	init_get_bits8(&gb, head, 16);
 	memset(&h, 0, sizeof(h));
 	if (parse_core_frame_header(&h, &gb) < 0)
 		return 0;
 
-	info[0] = h.frame_size;
+	info[0] = stream_frame_size(data, h.frame_size);
 	info[1] = ff_dca_sample_rates[h.sr_code];
 	info[2] = ff_dca_channels[h.audio_mode] + !!h.lfe_present;
 	info[3] = ff_dca_bit_rates[h.br_code];
@@ -1426,9 +1464,9 @@ int dts_decode_frame(DTSContext *s, const uint8_t *data, int size, int *info)
 
 	if (size < 16)
 		return 0;
-	if (size > DCA_FRAME_BYTES_MAX)
-		size = DCA_FRAME_BYTES_MAX;
-	if (!convert_bitstream(data, size, s->buffer))
+	const uint8_t *stream = data;
+	size = convert_bitstream(data, size, s->buffer, DCA_FRAME_BYTES_MAX);
+	if (size < 16)
 		return 0;
 	memset(s->buffer + size, 0, DCA_INPUT_PADDING);
 
@@ -1439,13 +1477,13 @@ int dts_decode_frame(DTSContext *s, const uint8_t *data, int size, int *info)
 		DCACoreFrameHeader h;
 		memset(&h, 0, sizeof(h));
 		if (parse_core_frame_header(&h, &s->gb) == 0)
-			info[0] = h.frame_size;
+			info[0] = stream_frame_size(stream, h.frame_size);
 		return 0;
 	}
 
 	filter_frame_float(s);
 
-	info[0] = s->frame_size;
+	info[0] = stream_frame_size(stream, s->frame_size);
 	info[1] = s->sample_rate;
 	info[2] = popcount(s->ch_mask);
 	info[3] = s->npcmsamples;
