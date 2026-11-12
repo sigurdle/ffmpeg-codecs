@@ -11,3 +11,6 @@
 
 # ...and so is a JS file that holds ported tables: its FFmpeg-derived data ships in the app.
 !qt_palette.js
+
+# ...and the JS ports outside the plugins tree, which ship as source.
+!fileformats/helpers/**/*.js
